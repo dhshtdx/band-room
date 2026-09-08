@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" /><title>Band Room</title><link rel="stylesheet" href="/styles.css?v=ui-cleanup-1" /></head>
+  <body>
+    <main class="shell">
+      <header><p class="eyebrow">Band Room</p><h1>乐队排练室</h1><p id="connection">正在连接主机…</p></header>
+      <section id="lobby" class="card">
+        <div id="host-actions"><h2>主机端</h2><button id="create-room">创建排练房间</button></div>
+        <div id="join-actions"><h2>乐手端</h2><label>房间号<input id="room-id" inputmode="numeric" pattern="[0-9]{7}" maxlength="7" placeholder="7 位数字" /></label><label>昵称<input id="name" maxlength="24" placeholder="你的名字" /></label><label>乐器<select id="instrument"><option value="guitar">吉他</option><option value="bass">贝斯</option><option value="drums">鼓</option><option value="keys">键盘</option><option value="vocals">人声</option><option value="other">其他</option></select></label><button id="join-room">加入排练</button></div>
+      </section>
+      <section id="room" class="card hidden"><h2 id="room-title"></h2><p id="host-url" class="url"></p><img id="join-qr" class="hidden" alt="手机加入排练房间二维码" /><div class="score-panel"><h3>曲谱</h3><p id="score-empty">尚未加载曲谱</p><div id="score-host-actions" class="hidden"><label>Guitar Pro 文件<input id="score-file" type="file" accept=".gp,.gp3,.gp4,.gp5,.gpx" /></label><button id="load-score">加载曲谱</button></div><div id="score-details" class="hidden"><p id="score-title"></p><p id="score-meta"></p><label>显示轨道<select id="track-select"></select></label><button id="fullscreen-score" type="button">全屏看谱</button></div></div><div id="render-status" class="hidden" aria-live="polite">正在加载谱面…</div><div id="audio-status" class="hidden">尚未准备伴奏</div><div id="alpha-tab" class="hidden"></div><button id="fullscreen-exit" class="hidden" type="button">退出全屏</button><div id="sync-debug" class="hidden" aria-live="polite"><strong>同步诊断</strong><dl id="sync-debug-text"></dl></div><div id="runtime-errors" class="hidden" role="alert"><strong>运行错误</strong><pre id="runtime-errors-text"></pre></div><div class="transport"><p id="transport-status">已暂停</p><p id="position" aria-live="off">00:00.000</p><div id="host-transport" class="hidden"><button id="prepare-audio">准备伴奏</button><button id="toggle-play" disabled>播放</button><label>跳转位置（秒）<input id="seek-seconds" type="number" min="0" step="0.1" value="0" /></label><button id="seek">跳转</button></div></div><h3>在线成员</h3><ul id="members"></ul></section>
+      <p id="notice" role="alert"></p>
+      <footer><a href="/legal.html">隐私与开源许可</a><span>Band Room 与 Guitar Pro / Arobas Music 无关联</span></footer>
+    </main><script type="module" src="/app.js?v=ui-cleanup-1"></script>
+  </body>
+</html>

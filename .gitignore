@@ -1,0 +1,50 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Dependencies and caches
+node_modules/
+android-host/node_modules/
+android-host/android/.gradle/
+android-host/android/.cxx/
+android-host/android/build/
+android-host/android/app/build/
+android-host/ios/Pods/
+
+# Generated releases
+release/
+dist/
+*.dmg
+*.exe
+*.msi
+*.apk
+*.aab
+
+# User supplied scores and runtime data
+work/
+*.gp
+*.gp3
+*.gp4
+*.gp5
+*.gpx
+
+# Local Android and signing secrets
+android-host/android/local.properties
+android-host/android/keystore.properties
+android-host/android/*.keystore
+android-host/android/*.jks
+android-host/android/app/*.keystore
+android-host/android/app/*.jks
+
+# Apple signing and notarization secrets
+*.p12
+*.cer
+*.provisionprofile
+.env
+.env.*
+!.env.example
+
+# Logs and test output
+*.log
+coverage/
+android-host/coverage/

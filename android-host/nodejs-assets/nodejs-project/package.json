@@ -1,0 +1,17 @@
+{
+  "name": "band-room-android-server",
+  "version": "1.0.3",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "main": "main.cjs",
+  "dependencies": {
+    "@coderline/alphatab": "1.8.4",
+    "express": "5.2.1",
+    "qrcode": "1.5.4",
+    "ws": "8.21.3"
+  },
+  "overrides": {
+    "qs": "6.16.0"
+  }
+}
