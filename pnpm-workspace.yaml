@@ -1,0 +1,7 @@
+allowBuilds:
+  electron-winstaller: false
+overrides:
+  qs: 6.16.0
+  # GHSA-jqcg-44mw-7w3h：Express 间接依赖的 proxy-addr 2.0.7 存在 IP 伪造问题，
+  # 固定到已修复的 2.0.8。本项目未启用 trust proxy，仍应升级以免将来踩坑。
+  proxy-addr: 2.0.8
