@@ -1,0 +1,97 @@
+{
+  "name": "band-rehearsal-assistant",
+  "productName": "Band Room",
+  "description": "局域网乐队排练辅助系统：Guitar Pro 曲谱、伴奏播放与多设备同步。",
+  "author": "Band Room contributors",
+  "version": "1.0.4",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "main": "desktop/main.js",
+  "scripts": {
+    "dev": "node server/index.js",
+    "start": "node server/index.js",
+    "desktop": "electron .",
+    "check": "node --check server/index.js && node --check public/app.js && node --check public/legal.js && node --check desktop/main.js && node --check scripts/release-preflight.mjs && node --check scripts/generate-checksums.mjs && node --test",
+    "dist:mac": "node scripts/release-preflight.mjs && electron-builder --mac dmg --arm64 --x64",
+    "dist:win": "node scripts/release-preflight.mjs && electron-builder --win nsis --x64",
+    "dist:checksums": "node scripts/generate-checksums.mjs"
+  },
+  "dependencies": {
+    "@coderline/alphatab": "^1.8.4",
+    "express": "^5.2.1",
+    "qrcode": "^1.5.4",
+    "ws": "^8.21.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "build": {
+    "appId": "com.bandroom.rehearsal",
+    "productName": "Band Room",
+    "asar": true,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "desktop/**/*",
+      "server/**/*",
+      "public/**/*",
+      "legal/**/*",
+      "LICENSE",
+      "THIRD_PARTY_NOTICES.md",
+      "PRIVACY.md",
+      "TERMS.md",
+      "TRADEMARKS.md",
+      "CHANGELOG.md",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.music",
+      "icon": "build/icon.icns",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "extendInfo": {
+        "NSLocalNetworkUsageDescription": "Band Room 需要在本地网络上运行排练服务器，让同一 Wi‑Fi 下的乐手设备加入房间、读取临时曲谱并同步播放位置。"
+      },
+      "target": [
+        "dmg"
+      ]
+    },
+    "dmg": {
+      "title": "Band Room ${version}",
+      "iconSize": 112,
+      "contents": [
+        {
+          "x": 150,
+          "y": 190
+        },
+        {
+          "x": 410,
+          "y": 190,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "icon": "build/icon.svg",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Band Room",
+      "runAfterFinish": true
+    }
+  },
+  "devDependencies": {
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3"
+  }
+}

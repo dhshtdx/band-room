@@ -1,0 +1,33 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Dependencies and caches
+node_modules/
+
+# Generated releases
+release/
+dist/
+*.dmg
+*.exe
+*.msi
+
+# User supplied scores and runtime data
+work/
+*.gp
+*.gp3
+*.gp4
+*.gp5
+*.gpx
+
+# Signing and notarization secrets
+*.p12
+*.cer
+*.provisionprofile
+.env
+.env.*
+!.env.example
+
+# Logs and test output
+*.log
+coverage/
