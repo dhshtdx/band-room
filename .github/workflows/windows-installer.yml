@@ -1,0 +1,94 @@
+name: Windows installer
+
+# 在 Windows runner 上原生构建 NSIS 安装器。macOS 上打 Windows 包需要 wine，
+# 因此把这一步放到 Windows 上执行。
+#
+# 手动触发：Actions → Windows installer → Run workflow
+#   attach_to_release 留空 → 只产出构建产物（artifact）
+#   attach_to_release 填 v1.0.4 → 把 exe 直接附到该 Release
+# 推送版本标签（如 v1.0.5）会自动触发，并附到同名 Release。
+
+on:
+  workflow_dispatch:
+    inputs:
+      attach_to_release:
+        description: '要附加到的 Release 标签（留空则只产出构建产物）'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # pnpm check 含 release-preflight：校验法律文件、版本号与 CHANGELOG 一致
+      - run: pnpm check
+
+      # --publish never：只产出安装包；发布交给下面的步骤，
+      # 避免 electron-builder 在 CI 中隐式发布。
+      - run: pnpm exec electron-builder --win nsis --x64 --publish never
+
+      - name: 查找安装包
+        id: find
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path release -Filter '*.exe' -File |
+                 Where-Object { $_.Name -notlike '*.blockmap' } |
+                 Select-Object -First 1
+          if (-not $exe) { Write-Error '没有找到 exe 安装包'; exit 1 }
+          "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($exe.Name)"     >> $env:GITHUB_OUTPUT
+
+      - name: 生成 SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 '${{ steps.find.outputs.path }}').Hash.ToLower()
+          "$hash  ${{ steps.find.outputs.name }}" |
+            Out-File -FilePath release/SHA256SUMS-windows.txt -Encoding utf8
+          Get-Content release/SHA256SUMS-windows.txt
+
+      - name: 上传为构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: band-room-windows-${{ github.run_number }}
+          path: |
+            release/*.exe
+            release/SHA256SUMS-windows.txt
+          if-no-files-found: error
+
+      - name: 附加到 Release
+        if: github.event_name == 'push' || inputs.attach_to_release != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.attach_to_release }}
+          ASSET: ${{ steps.find.outputs.name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG 已存在，附加安装包"
+            gh release upload "$TAG" "release/$ASSET" release/SHA256SUMS-windows.txt \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "Release $TAG 不存在，创建并附加"
+            gh release create "$TAG" "release/$ASSET" release/SHA256SUMS-windows.txt \
+              --repo "$GITHUB_REPOSITORY" --title "Band Room $TAG" --draft
+          fi
