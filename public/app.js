@@ -15,13 +15,13 @@ let clientId = readSession(clientIdKey);
 if (!clientId) { clientId = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`; writeSession(clientIdKey, clientId); }
 let resumeInfo = (() => { try { return JSON.parse(readSession(resumeKey) || 'null'); } catch { return null; } })();
 if (pageRole === 'member' && requestedRoomId && resumeInfo?.roomId !== requestedRoomId) { resumeInfo = null; writeSession(resumeKey, null); }
-let socket = null; let reconnectTimer = null; let reconnectAttempt = 0; let memberIdentity = pageRole === 'member' ? resumeInfo : null; let isHost = false; let roomId = null; let hostToken = null; let score = null; let selectedTrack = 0; let lastKnownPlaying = null; let latestPlayback = null; let controlPending = false; let pendingPlaybackTarget = null; let explicitlyPaused = false; let alphaTabApi = null; let audioReady = false; let audioLoading = false; let audioNoteEvents = 0; let audioPlayerState = alphaTab.synth.PlayerState.Paused; let audioLoadTimer = null; let audioStatusTimer = null; let playAfterAudioReady = false; let followerCursor = null; let followerBuildTimer = null; let lastPlaybackMessageAt = null; let scoreClickHandler = null; const runtimeErrors = [];
+let socket = null; let reconnectTimer = null; let reconnectAttempt = 0; let memberIdentity = pageRole === 'member' ? resumeInfo : null; let isHost = false; let roomId = null; let hostToken = null; let source = null; let selectedTrack = 0; let lastKnownPlaying = null; let latestPlayback = null; let controlPending = false; let pendingPlaybackTarget = null; let explicitlyPaused = false; let alphaTabApi = null; let audioReady = false; let audioLoading = false; let audioNoteEvents = 0; let audioPlayerState = alphaTab.synth.PlayerState.Paused; let audioLoadTimer = null; let audioStatusTimer = null; let playAfterAudioReady = false; let followerCursor = null; let followerBuildTimer = null; let lastPlaybackMessageAt = null; let scoreClickHandler = null; const runtimeErrors = [];
 function persistResume(value) { resumeInfo = value; writeSession(resumeKey, value ? JSON.stringify(value) : null); }
 function positionForTick(tick) {
-  const points = score?.tempoMap ?? []; let point = points[0] ?? null;
+  const points = source?.tempoMap ?? []; let point = points[0] ?? null;
   for (const candidate of points) { if (candidate.tick > tick) break; point = candidate; }
-  if (!point) return Math.max(0, Math.round(tick * 60000 / (((score?.tempo || 120) * 960))));
-  return Math.max(0, Math.min(score.durationMs ?? Number.POSITIVE_INFINITY, Math.round(point.timeMs + (tick - point.tick) * 60000 / (point.tempo * 960))));
+  if (!point) return Math.max(0, Math.round(tick * 60000 / (((source?.tempo || 120) * 960))));
+  return Math.max(0, Math.min(source.durationMs ?? Number.POSITIVE_INFINITY, Math.round(point.timeMs + (tick - point.tick) * 60000 / (point.tempo * 960))));
 }
 function initializeAlphaTab() {
   const scoreElement = $('#alpha-tab');
@@ -42,7 +42,7 @@ function initializeAlphaTab() {
       const beat = lookup.getBeatAtPos(event.clientX - rect.left, event.clientY - rect.top);
       const barIndex = beat?.voice?.bar?.index;
       const masterBar = Number.isInteger(barIndex) ? model.masterBars[barIndex] : null;
-      const playedBar = score?.playbackTimeline?.find((entry) => entry.barIndex === barIndex);
+      const playedBar = source?.playbackTimeline?.find((entry) => entry.barIndex === barIndex);
       const tick = (playedBar?.startTick ?? masterBar?.start) + beat?.playbackStart;
       if (!Number.isFinite(tick)) return;
       const positionMs = positionForTick(tick);
@@ -95,7 +95,7 @@ function buildFollower() {
   const model = alphaTabApi?.score; const lookup = alphaTabApi?.boundsLookup; const track = model?.tracks[selectedTrack];
   if (!model || !lookup || !track) return false;
   const uniqueBeats = new Map();
-  const timeline = score?.playbackTimeline?.length ? score.playbackTimeline : model.masterBars.map((bar, barIndex) => ({ barIndex, startTick: bar.start }));
+  const timeline = source?.playbackTimeline?.length ? source.playbackTimeline : model.masterBars.map((bar, barIndex) => ({ barIndex, startTick: bar.start }));
   for (const playedBar of timeline) for (const staff of track.staves) {
     const bar = staff.bars[playedBar.barIndex]; if (!bar) continue;
     for (const voice of bar.voices) for (const beat of voice.beats) {
@@ -112,11 +112,33 @@ function buildFollower() {
 }
 function followFollowerCursor(scoreX) { const scroller = $('#alpha-tab'); const targetLeft = Math.max(0, Math.min(scroller.scrollWidth - scroller.clientWidth, scoreX - scroller.clientWidth * 0.35)); scroller.scrollLeft = targetLeft; }
 function updateFollower(positionMs, playback) { if (!followerCursor || !followerCursor.node.isConnected) { scheduleFollowerBuild(); return updateSyncDebug({ playback, issue: '正在重新挂载同步游标' }); } const tick = playback.serverTick ?? Math.round(positionMs * followerCursor.tempo * 960 / 60000); let low = 0; let high = followerCursor.beats.length - 1; let match = null; while (low <= high) { const middle = Math.floor((low + high) / 2); if (followerCursor.beats[middle].tick <= tick) { match = followerCursor.beats[middle]; low = middle + 1; } else high = middle - 1; } if (!match) return updateSyncDebug({ playback, tick, issue: followerCursor.beats.length ? '播放位置在第一拍之前' : '没有可查找的 beat' }); const cursor = { x: match.bounds.onNotesX - 1, y: 0, h: followerCursor.scoreSurface.scrollHeight }; followerCursor.node.style.transform = `translate(${cursor.x}px, ${cursor.y}px)`; followerCursor.node.style.height = `${cursor.h}px`; followerCursor.node.hidden = false; followFollowerCursor(cursor.x); updateSyncDebug({ playback, tick, match, cursor }); }
-function renderPlayback(playback) { latestPlayback = playback; if (pendingPlaybackTarget === null || playback.isPlaying === pendingPlaybackTarget) { controlPending = false; pendingPlaybackTarget = null; } const displayedPlaying = pendingPlaybackTarget ?? playback.isPlaying; if (isHost) { $('#toggle-play').disabled = false; $('#alpha-tab').classList.toggle('host-paused-cursor', !playback.isPlaying); } $('#transport-status').textContent = playback.isPlaying ? '播放中' : '已暂停'; $('#position').textContent = formatPosition(playback.positionMs); $('#toggle-play').textContent = displayedPlaying ? '暂停' : '播放'; $('#seek-seconds').value = (playback.positionMs / 1000).toFixed(1); if (!score || !alphaTabApi) { if (!isHost) updateSyncDebug({ playback, issue: '等待曲谱加载' }); return; } const playingFlipped = lastKnownPlaying === null || playback.isPlaying !== lastKnownPlaying; lastKnownPlaying = playback.isPlaying; if (isHost && playingFlipped && alphaTabApi.isReadyForPlayback) { alphaTabApi.timePosition = playback.positionMs; if (audioReady && playback.isPlaying) alphaTabApi.play(); if (!playback.isPlaying) alphaTabApi.pause(); } updateFollower(playback.positionMs, playback); }
+function renderPlayback(playback) { latestPlayback = playback; if (pendingPlaybackTarget === null || playback.isPlaying === pendingPlaybackTarget) { controlPending = false; pendingPlaybackTarget = null; } const displayedPlaying = pendingPlaybackTarget ?? playback.isPlaying; if (isHost) { $('#toggle-play').disabled = false; $('#alpha-tab').classList.toggle('host-paused-cursor', !playback.isPlaying); } $('#transport-status').textContent = playback.isPlaying ? '播放中' : '已暂停'; $('#position').textContent = formatPosition(playback.positionMs); $('#toggle-play').textContent = displayedPlaying ? '暂停' : '播放'; $('#seek-seconds').value = (playback.positionMs / 1000).toFixed(1); if (source?.kind !== 'score' || !alphaTabApi) { if (!isHost) updateSyncDebug({ playback, issue: '等待曲谱加载' }); return; } const playingFlipped = lastKnownPlaying === null || playback.isPlaying !== lastKnownPlaying; lastKnownPlaying = playback.isPlaying; if (isHost && playingFlipped && alphaTabApi.isReadyForPlayback) { alphaTabApi.timePosition = playback.positionMs; if (audioReady && playback.isPlaying) alphaTabApi.play(); if (!playback.isPlaying) alphaTabApi.pause(); } updateFollower(playback.positionMs, playback); }
 function resumeIfServerPlaying() { if (!isHost || !alphaTabApi || !latestPlayback || explicitlyPaused) return; if (latestPlayback.isPlaying && audioReady && alphaTabApi.isReadyForPlayback) { alphaTabApi.timePosition = latestPlayback.positionMs; alphaTabApi.play(); } }
 let renderTimeout = null;
-async function loadSelectedTrack() { if (!score || !roomId || !alphaTabApi) return; followerCursor = null; clearTimeout(renderTimeout); $('#alpha-tab').classList.remove('hidden'); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在加载并排版谱面…'; renderTimeout = setTimeout(() => { $('#render-status').textContent = '排版超过 30 秒：请刷新页面后重试，并检查浏览器控制台错误。'; }, 30000); try { const response = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/score`, { cache: 'no-store' }); if (!response.ok) throw new Error('无法获取房间曲谱。'); const bytes = await response.arrayBuffer(); alphaTabApi.load(bytes, [selectedTrack]); } catch (error) { clearTimeout(renderTimeout); $('#render-status').textContent = `谱面加载失败：${error.message}`; } }
-function renderScore(nextScore) { score = nextScore; $('#score-empty').classList.toggle('hidden', Boolean(score)); $('#score-details').classList.toggle('hidden', !score); if (!score) return; $('#score-title').textContent = score.title; $('#score-meta').textContent = [score.artist, score.tempo ? `${score.tempo} BPM` : '', `${score.barCount} 小节`, score.tempoMap?.length > 2 ? `${score.tempoMap.length - 2} 次变速` : '固定速度'].filter(Boolean).join(' · '); $('#track-select').innerHTML = score.tracks.map((track) => `<option value="${track.index}">${track.index + 1}. ${track.name}</option>`).join(''); selectedTrack = Math.min(selectedTrack, score.tracks.length - 1); $('#track-select').value = String(selectedTrack); loadSelectedTrack(); }
+async function loadSelectedTrack() {
+  if (source?.kind !== 'score' || !roomId || !alphaTabApi) return;
+  const sourceId = source.id; const api = alphaTabApi; const track = selectedTrack;
+  const isCurrent = () => source?.id === sourceId && alphaTabApi === api && selectedTrack === track;
+  followerCursor = null; clearTimeout(renderTimeout);
+  $('#alpha-tab').classList.remove('hidden'); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在加载并排版谱面…';
+  renderTimeout = setTimeout(() => { $('#render-status').textContent = '排版超过 30 秒：请刷新页面后重试，并检查浏览器控制台错误。'; }, 30000);
+  try {
+    const response = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/score/${encodeURIComponent(sourceId)}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error('无法获取房间曲谱。');
+    const bytes = await response.arrayBuffer();
+    if (isCurrent()) api.load(bytes, [track]);
+  } catch (error) {
+    if (!isCurrent()) return;
+    clearTimeout(renderTimeout); $('#render-status').textContent = `谱面加载失败：${error.message}`;
+  }
+}
+function renderSource(nextSource) {
+  source = nextSource;
+  alphaTabApi?.pause(); followerCursor = null; lastKnownPlaying = null;
+  pendingPlaybackTarget = null; controlPending = false; playAfterAudioReady = false;
+  renderScoreSource(source?.kind === 'score' ? source : null);
+}
+function renderScoreSource(score) { $('#score-empty').classList.toggle('hidden', Boolean(score)); $('#score-details').classList.toggle('hidden', !score); if (!score) return; $('#score-title').textContent = score.title; $('#score-meta').textContent = [score.artist, score.tempo ? `${score.tempo} BPM` : '', `${score.barCount} 小节`, score.tempoMap?.length > 2 ? `${score.tempoMap.length - 2} 次变速` : '固定速度'].filter(Boolean).join(' · '); $('#track-select').innerHTML = score.tracks.map((track) => `<option value="${track.index}">${track.index + 1}. ${track.name}</option>`).join(''); selectedTrack = Math.max(0, Math.min(selectedTrack, score.tracks.length - 1)); $('#track-select').value = String(selectedTrack); loadSelectedTrack(); }
 function resetExpiredRoom() {
   persistResume(null); memberIdentity = null; roomId = null; hostToken = null; isHost = false;
   lobby.classList.remove('hidden'); roomPanel.classList.add('hidden');
@@ -131,10 +153,10 @@ function handleSocketMessage({ data }) {
   }
   if (event.type === 'room:members') return renderMembers(event.members);
   if (event.type === 'playback:state') { lastPlaybackMessageAt = Date.now(); return renderPlayback(event.playback); }
-  if (event.type === 'score:loaded') return renderScore(event.score);
+  if (event.type === 'source:loaded') return renderSource(event.source);
   if (event.type !== 'room:joined') return;
   const sameRoom = roomId === event.room.id && Boolean(alphaTabApi);
-  const scoreChanged = score?.fileName !== event.score?.fileName || score?.barCount !== event.score?.barCount;
+  const sourceChanged = source?.id !== event.source?.id;
   notice.textContent = ''; lobby.classList.add('hidden'); roomPanel.classList.remove('hidden'); roomId = event.room.id;
   $('#room-title').textContent = `房间 ${roomId}`; isHost = pageRole === 'host' && event.room.isHost;
   renderJoinAccess(roomId);
@@ -143,8 +165,9 @@ function handleSocketMessage({ data }) {
   else if (memberIdentity) persistResume({ roomId, name: memberIdentity.name, instrument: memberIdentity.instrument });
   if (!sameRoom) initializeAlphaTab();
   $('#host-transport').classList.toggle('hidden', !isHost); $('#score-host-actions').classList.toggle('hidden', !isHost); $('#sync-debug').classList.toggle('hidden', isHost || !debugMode);
-  renderMembers(event.members); renderPlayback(event.playback);
-  if (!sameRoom || scoreChanged) renderScore(event.score);
+  renderMembers(event.members);
+  if (!sameRoom || sourceChanged) renderSource(event.source);
+  renderPlayback(event.playback);
   connection.textContent = '已连接并进入房间';
 }
 function scheduleReconnect() {

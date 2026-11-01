@@ -25,7 +25,7 @@ function lanAddresses() { return Object.values(os.networkInterfaces()).flat().fi
 
 function createRoom() {
   let id; do { id = crypto.randomInt(1_000_000, 10_000_000).toString(); } while (rooms.has(id));
-  const room = { id, hostToken: crypto.randomBytes(24).toString('base64url'), members: new Set(), score: null, cleanupTimer: null, playback: { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: 0 } };
+  const room = { id, hostToken: crypto.randomBytes(24).toString('base64url'), members: new Set(), source: null, cleanupTimer: null, playback: { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: 0 } };
   rooms.set(id, room); return room;
 }
 function members(room) { return [...room.members].map((socket) => ({ name: socket.member.name, instrument: socket.member.instrument })); }
@@ -47,15 +47,16 @@ function tickToPosition(score, tick) {
 }
 function playbackState(room) {
   const state = room.playback;
+  const score = room.source?.kind === 'score' ? room.source : null;
   const rawPositionMs = Math.round(state.positionMs + (state.isPlaying ? Date.now() - state.updatedAt : 0));
-  const positionMs = room.score?.durationMs ? Math.min(rawPositionMs, room.score.durationMs) : rawPositionMs;
-  const isPlaying = state.isPlaying && positionMs < (room.score?.durationMs ?? Number.POSITIVE_INFINITY);
-  const serverTick = positionToTick(room.score, positionMs);
-  const timeline = room.score?.playbackTimeline || [];
+  const positionMs = room.source?.durationMs !== undefined ? Math.min(rawPositionMs, room.source.durationMs) : rawPositionMs;
+  const isPlaying = state.isPlaying && positionMs < (room.source?.durationMs ?? Number.POSITIVE_INFINITY);
+  const serverTick = room.source && !score ? 0 : positionToTick(score, positionMs);
+  const timeline = score?.playbackTimeline || [];
   const timelineEntry = findLastAtOrBefore(timeline, serverTick, 'startTick') || { startTick: 0, numerator: 4, denominator: 4, measure: 1, occurrence: 0 };
   const ticksPerBeat = 960 * 4 / (timelineEntry.denominator || 4);
-  const tempoPoint = findLastAtOrBefore(room.score?.tempoMap ?? [], serverTick, 'tick');
-  return { ...state, isPlaying, positionMs, serverTick, currentTempo: tempoPoint?.tempo ?? room.score?.tempo ?? 120, measure: timelineEntry.measure, beat: Math.max(1, Math.floor((serverTick - timelineEntry.startTick) / ticksPerBeat) + 1), occurrence: timelineEntry.occurrence, timestamp: Date.now(), serverNow: Date.now() };
+  const tempoPoint = findLastAtOrBefore(score?.tempoMap ?? [], serverTick, 'tick');
+  return { ...state, isPlaying, positionMs, serverTick, currentTempo: tempoPoint?.tempo ?? score?.tempo ?? 120, measure: timelineEntry.measure, beat: Math.max(1, Math.floor((serverTick - timelineEntry.startTick) / ticksPerBeat) + 1), occurrence: timelineEntry.occurrence, timestamp: Date.now(), serverNow: Date.now() };
 }
 function updatePlayback(room, patch) { const current = playbackState(room); room.playback = { isPlaying: patch.isPlaying ?? current.isPlaying, positionMs: Number.isFinite(patch.positionMs) ? Math.max(0, Math.round(patch.positionMs)) : current.positionMs, updatedAt: Date.now(), revision: current.revision + 1 }; broadcast(room, { type: 'playback:state', playback: playbackState(room) }); }
 function cancelRoomCleanup(room) { if (room.cleanupTimer) clearTimeout(room.cleanupTimer); room.cleanupTimer = null; }
@@ -64,7 +65,7 @@ function scheduleRoomCleanup(room) {
   room.cleanupTimer = setTimeout(() => {
     room.cleanupTimer = null;
     if (room.members.size || rooms.get(room.id) !== room) return;
-    if (room.score?.storagePath) rm(room.score.storagePath, { force: true }).catch(() => {});
+    removeStoredSource(room.source).catch(reportSourceCleanupError);
     rooms.delete(room.id);
   }, roomCleanupGraceMs);
 }
@@ -89,7 +90,7 @@ function joinSocket(room, socket, member) {
   room.members.add(socket);
 }
 function joinedEvent(room, socket, hostToken = null) {
-  return { type: 'room:joined', room: { id: room.id, isHost: socket.member.isHost }, ...(hostToken ? { hostToken } : {}), members: members(room), playback: playbackState(room), score: publicScore(room.score) };
+  return { type: 'room:joined', room: { id: room.id, isHost: socket.member.isHost }, ...(hostToken ? { hostToken } : {}), members: members(room), playback: playbackState(room), source: publicSource(room.source) };
 }
 function buildPlaybackTiming(score) {
   const syncPoints = midi.MidiFileGenerator.generateSyncPoints(score, true);
@@ -108,15 +109,36 @@ function buildPlaybackTiming(score) {
   return { tempoMap, playbackTimeline, durationTicks, durationMs };
 }
 function serializeScore(score, fileName) { return { fileName, title: score.title || basename(fileName, extname(fileName)), artist: score.artist || '', album: score.album || '', tempo: score.tempo, barCount: score.masterBars.length, ...buildPlaybackTiming(score), tracks: score.tracks.map((track, index) => ({ index, name: track.name || `轨道 ${index + 1}`, isPercussion: track.staves.some((staff) => staff.isPercussion), stringCount: track.staves[0]?.tuning?.tunings?.length ?? 0 })) }; }
-function publicScore(score) { if (!score) return null; const { storagePath, ...metadata } = score; return metadata; }
+function publicSource(source) { if (!source) return null; const { storagePath, ...metadata } = source; return metadata; }
+async function removeStoredSource(source) {
+  if (!source?.storagePath) return;
+  for (let attempt = 0; ; attempt += 1) {
+    try { await rm(source.storagePath, { force: true }); return; }
+    catch (error) {
+      if (!['EBUSY', 'EPERM', 'EACCES'].includes(error.code) || attempt >= 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+    }
+  }
+}
+function reportSourceCleanupError(error) { console.error('无法清理播放源临时文件：', error); }
+function replaceSource(room, nextSource) {
+  const previousSource = room.source;
+  room.playback = { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: room.playback.revision + 1 };
+  room.source = nextSource;
+  broadcast(room, { type: 'source:loaded', source: publicSource(nextSource) });
+  broadcast(room, { type: 'playback:state', playback: playbackState(room) });
+  removeStoredSource(previousSource).catch(reportSourceCleanupError);
+}
 async function storeAndParseScore(room, upload) {
   const raw = Buffer.from(upload.data, 'base64'); const fileName = basename(String(upload.name ?? 'score.gp'));
   if (!raw.length || raw.length > 20 * 1024 * 1024) throw new Error('曲谱文件必须介于 1 字节和 20 MB 之间。');
   if (!allowedScoreExtensions.has(extname(fileName).toLowerCase())) throw new Error('仅支持 .gp、.gp3、.gp4、.gp5、.gpx 文件。');
   let score; try { score = importer.ScoreLoader.loadScoreFromBytes(new Uint8Array(raw)); } catch { throw new Error('无法解析此 Guitar Pro 文件，请确认文件未损坏且格式受支持。'); }
-  await mkdir(scoresDir, { recursive: true }); if (room.score?.storagePath) await rm(room.score.storagePath, { force: true });
-  const storagePath = join(scoresDir, `${room.id}-${Date.now()}${extname(fileName).toLowerCase()}`); await writeFile(storagePath, raw);
-  room.score = { ...serializeScore(score, fileName), storagePath }; return room.score;
+  const source = { kind: 'score', id: crypto.randomUUID(), ...serializeScore(score, fileName) };
+  await mkdir(scoresDir, { recursive: true });
+  const storagePath = join(scoresDir, `${room.id}-${source.id}${extname(fileName).toLowerCase()}`);
+  await writeFile(storagePath, raw);
+  return { ...source, storagePath };
 }
 
 const app = express();
@@ -149,7 +171,7 @@ app.get('/api/qrcode', async (request, response) => {
   if (!['http:', 'https:'].includes(target.protocol)) return response.status(400).json({ message: '无效二维码地址。' });
   response.json({ dataUrl: await QRCode.toDataURL(target.href, { width: 260, margin: 1 }) });
 });
-app.get('/api/rooms/:roomId/score', async (request, response) => { const room = rooms.get(request.params.roomId); if (!room?.score?.storagePath) return response.status(404).json({ message: '此房间尚未加载曲谱。' }); response.type('application/octet-stream').send(await readFile(room.score.storagePath)); });
+app.get('/api/rooms/:roomId/score/:sourceId', async (request, response) => { const source = rooms.get(request.params.roomId)?.source; if (source?.kind !== 'score' || source.id !== request.params.sourceId || !source.storagePath) return response.status(404).json({ message: '此曲谱来源已失效或尚未加载。' }); response.type('application/octet-stream').send(await readFile(source.storagePath)); });
 const server = app.listen(port, '0.0.0.0');
 export const serverReady = new Promise((resolve, reject) => {
   server.once('listening', () => {
@@ -177,8 +199,8 @@ wss.on('connection', (socket) => socket.on('message', async (raw) => {
   }
   const room = socket.member?.roomId && rooms.get(socket.member.roomId);
   if (event.type === 'playback:request-state') { if (room) socket.send(JSON.stringify({ type: 'playback:state', playback: playbackState(room) })); return; }
-  if (event.type === 'score:upload') { if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; } try { broadcast(room, { type: 'score:loaded', score: publicScore(await storeAndParseScore(room, event.upload ?? {})) }); } catch (error) { socket.send(JSON.stringify({ type: 'error', message: error.message })); } return; }
-  if (event.type === 'playback:control') { if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; } if (event.action === 'set-playing' && typeof event.isPlaying === 'boolean') updatePlayback(room, { isPlaying: event.isPlaying }); if (event.action === 'seek') updatePlayback(room, { positionMs: Number(event.positionMs) }); if (event.action === 'seek-tick') updatePlayback(room, { positionMs: tickToPosition(room.score, Math.max(0, Number(event.tick) || 0)) }); return; }
+  if (event.type === 'score:upload') { if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; } try { replaceSource(room, await storeAndParseScore(room, event.upload ?? {})); } catch (error) { socket.send(JSON.stringify({ type: 'error', message: error.message })); } return; }
+  if (event.type === 'playback:control') { if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; } if (event.action === 'set-playing' && typeof event.isPlaying === 'boolean') updatePlayback(room, { isPlaying: event.isPlaying }); if (event.action === 'seek') updatePlayback(room, { positionMs: Number(event.positionMs) }); if (event.action === 'seek-tick') updatePlayback(room, { positionMs: tickToPosition(room.source?.kind === 'score' ? room.source : null, Math.max(0, Number(event.tick) || 0)) }); return; }
   if (event.type !== 'room:join') return;
   const roomId = String(event.roomId ?? ''); const targetRoom = rooms.get(roomId); const name = String(event.name ?? '').trim().slice(0, 24); const instrument = String(event.instrument ?? 'other');
   if (!/^\d{7}$/.test(roomId)) { socket.send(JSON.stringify({ type: 'error', code: 'INVALID_ROOM_ID', message: '请输入有效的 7 位数字房间号。' })); return; }
@@ -206,16 +228,16 @@ export async function stopBandRoomServer() {
   stopping = true;
   clearInterval(playbackTicker);
   clearInterval(heartbeat);
-  const scorePaths = [];
+  const sources = [];
   for (const room of rooms.values()) {
     cancelRoomCleanup(room);
-    if (room.score?.storagePath) scorePaths.push(room.score.storagePath);
+    if (room.source) sources.push(room.source);
   }
   for (const socket of wss.clients) socket.terminate();
   await Promise.allSettled([
     new Promise((resolve) => wss.close(resolve)),
     new Promise((resolve) => server.close(resolve)),
-    ...scorePaths.map((path) => rm(path, { force: true }))
+    ...sources.map((source) => removeStoredSource(source).catch(reportSourceCleanupError))
   ]);
   rooms.clear();
 }

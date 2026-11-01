@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import fs, { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -114,6 +115,8 @@ test('主机凭证、持续时钟、暂停和跳转形成最小同步闭环', as
   host.send({ type: 'room:create', clientId: 'host-test' });
   const hostJoined = await host.next('room:joined');
   assert.match(hostJoined.room.id, /^\d{7}$/);
+  assert.equal(hostJoined.source, null);
+  assert.equal('score' in hostJoined, false);
   assert.equal(typeof hostJoined.hostToken, 'string');
   assert.ok(hostJoined.hostToken.length >= 24);
 
@@ -189,11 +192,14 @@ test('曲谱上传校验：扩展名、体积与损坏文件', async () => {
   // 会给出一个只有默认速度、1 小节的"空谱"而不是抛错。这里锁定真实行为：
   // 服务器必须仍然给出响应（不崩溃、不断线），且曲谱元数据结构完整。
   host.send({ type: 'score:upload', hostToken, upload: fakeScoreBuffer(64) });
-  const loaded = await host.next('score:loaded');
-  assert.equal(typeof loaded.score.title, 'string');
-  assert.ok(Number.isFinite(loaded.score.tempo));
-  assert.ok(Array.isArray(loaded.score.tempoMap));
-  assert.ok(Array.isArray(loaded.score.playbackTimeline));
+  const loaded = await host.next('source:loaded');
+  assert.equal(loaded.source.kind, 'score');
+  assert.match(loaded.source.id, /^[a-f0-9-]{36}$/);
+  assert.equal('storagePath' in loaded.source, false);
+  assert.equal(typeof loaded.source.title, 'string');
+  assert.ok(Number.isFinite(loaded.source.tempo));
+  assert.ok(Array.isArray(loaded.source.tempoMap));
+  assert.ok(Array.isArray(loaded.source.playbackTimeline));
 
   // 主机仍然存活：上传后房间照常响应。
   host.send({ type: 'playback:control', hostToken, action: 'seek', positionMs: 1234 });
@@ -284,4 +290,108 @@ test('跳转与请求状态在时间线上保持一致（变速换算基础）',
 
   host.close();
   member.close();
+});
+
+
+test('曲谱来源替换暂停归零、更新加入状态并使旧来源地址失效', async () => {
+  const { host, hostToken, roomId, members: [member] } = await createRoomWithMembers(1);
+  const upload = fakeScoreBuffer(64);
+  const scoreUrl = (id) => `${origin}/api/rooms/${roomId}/score/${id}`;
+  host.send({ type: 'score:upload', hostToken, upload });
+  const first = (await host.next('source:loaded')).source;
+  assert.deepEqual((await member.next('source:loaded')).source, first);
+  const response = await fetch(scoreUrl(first.id));
+  assert.equal(response.status, 200);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.from(upload.data, 'base64'));
+  assert.equal((await fetch(scoreUrl('unknown-source'))).status, 404);
+  assert.equal((await fetch(`${origin}/api/rooms/${roomId}/score`)).status, 404);
+
+  host.send({ type: 'playback:control', hostToken, action: 'seek-tick', tick: 960 });
+  const sought = await host.next('playback:state', (event) => event.playback.serverTick === 960);
+  assert.equal(sought.playback.positionMs, 500);
+  assert.equal(sought.playback.measure, 1);
+  host.send({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true });
+  const playing = await host.next('playback:state', (event) => event.playback.isPlaying);
+
+  host.send({ type: 'score:upload', hostToken, upload });
+  const second = (await host.next('source:loaded')).source;
+  assert.notEqual(second.id, first.id);
+  assert.equal(second.fileName, first.fileName);
+  assert.equal('storagePath' in second, false);
+  assert.deepEqual((await member.next('source:loaded')).source, second);
+  const reset = await host.next('playback:state', (event) => event.playback.revision > playing.playback.revision && !event.playback.isPlaying);
+  assert.equal(reset.playback.positionMs, 0);
+  assert.equal(reset.playback.serverTick, 0);
+  assert.equal((await fetch(scoreUrl(first.id))).status, 404);
+  assert.equal((await fetch(scoreUrl(second.id))).status, 200);
+
+  host.send({ type: 'room:resume', roomId, hostToken, clientId: 'host-source-resume' });
+  assert.deepEqual((await host.next('room:joined')).source, second);
+  host.send({ type: 'playback:control', hostToken, action: 'seek', positionMs: second.durationMs + 1000 });
+  const clamped = await host.next('playback:state', (event) => event.playback.positionMs === second.durationMs);
+  assert.equal(clamped.playback.isPlaying, false);
+  assert.equal(clamped.playback.serverTick, second.durationTicks);
+
+  // 无效上传必须保留当前来源，不能先删除旧文件。
+  host.send({ type: 'score:upload', hostToken, upload: { name: 'invalid.pdf', data: upload.data } });
+  await host.next('error');
+  assert.equal((await fetch(scoreUrl(second.id))).status, 200);
+  // 等待异步清理完成，磁盘上只留下当前来源。
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const files = await readdir(join(dataDir, 'scores'));
+    if (!files.some((file) => file.includes(first.id))) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal((await readdir(join(dataDir, 'scores'))).some((file) => file.includes(first.id)), false);
+  host.close();
+  member.close();
+});
+
+
+test('来源清理短暂锁定时重试，清理失败仍上线新来源并报告错误', async (t) => {
+  for (const { code, failures, expectedAttempts } of [
+    { code: 'EBUSY', failures: 2, expectedAttempts: 3 },
+    { code: 'EBUSY', failures: Infinity, expectedAttempts: 3 },
+    { code: 'EIO', failures: Infinity, expectedAttempts: 1 }
+  ]) {
+    const { host, hostToken, roomId, members } = await createRoomWithMembers(0);
+    host.send({ type: 'score:upload', hostToken, upload: fakeScoreBuffer(64) });
+    const first = (await host.next('source:loaded')).source;
+    const oldFile = (await readdir(join(dataDir, 'scores'))).find((file) => file.includes(first.id));
+    assert.ok(oldFile);
+    const oldPath = join(dataDir, 'scores', oldFile);
+    const originalRm = fs.rm;
+    const errors = [];
+    let attempts = 0;
+    t.mock.method(fs, 'rm', async (path, options) => {
+      if (path === oldPath && ++attempts <= failures) throw Object.assign(new Error('清理失败'), { code });
+      return originalRm(path, options);
+    });
+    t.mock.method(console, 'error', (...args) => errors.push(args));
+    syncBuiltinESMExports();
+    try {
+      host.send({ type: 'score:upload', hostToken, upload: fakeScoreBuffer(64) });
+      const second = (await host.next('source:loaded')).source;
+      assert.notEqual(second.id, first.id);
+      assert.equal((await fetch(`${origin}/api/rooms/${roomId}/score/${second.id}`)).status, 200);
+      for (let wait = 0; wait < 50; wait += 1) {
+        const removed = await fs.access(oldPath).then(() => false, () => true);
+        if (failures === 2 ? removed : errors.length) break;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(attempts, expectedAttempts);
+      if (failures === 2) {
+        await assert.rejects(fs.access(oldPath), { code: 'ENOENT' });
+        assert.equal(errors.length, 0);
+      } else {
+        assert.equal(errors.length, 1);
+        assert.equal(errors[0].at(-1).code, code);
+      }
+    } finally {
+      t.mock.restoreAll();
+      syncBuiltinESMExports();
+      host.close();
+      for (const member of members) member.close();
+    }
+  }
 });
