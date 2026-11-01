@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import fs, { mkdtemp, readdir, rm } from 'node:fs/promises';
+import http from 'node:http';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough, Readable } from 'node:stream';
+import { streamVideoUpload } from '../server/video-media.js';
 import test from 'node:test';
 import WebSocket from 'ws';
 
@@ -394,6 +397,211 @@ test('来源清理短暂锁定时重试，清理失败仍上线新来源并报�
       for (const member of members) member.close();
     }
   }
+});
+
+const mp4Bytes = Buffer.from([0, 0, 0, 24, ...Buffer.from('ftypisom01234567')]);
+const webmBytes = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3, 4]);
+function uploadVideo(roomId, hostToken, body = mp4Bytes, headers = {}) {
+  return fetch(`${origin}/api/rooms/${roomId}/video`, {
+    method: 'POST', headers: { authorization: `Bearer ${hostToken}`, 'content-type': 'video/mp4', 'x-file-name': encodeURIComponent('排练.mp4'), ...headers }, body,
+  });
+}
+async function videoFiles() { return readdir(join(dataDir, 'videos')).catch((error) => { if (error.code === 'ENOENT') return []; throw error; }); }
+async function waitForUploadFile() {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if ((await videoFiles()).some((name) => name.endsWith('.upload'))) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('等待上传临时文件超时');
+}
+function beginChunkedUpload(roomId, hostToken, t) {
+  let resolveResponse;
+  let rejectResponse;
+  const response = new Promise((resolve, reject) => { resolveResponse = resolve; rejectResponse = reject; });
+  // 闸门等待期间也收集拒绝，避免失败清理时出现未处理 rejection。
+  response.catch(() => {});
+  const request = http.request(`${origin}/api/rooms/${roomId}/video`, { method: 'POST', agent: false, headers: {
+    authorization: `Bearer ${hostToken}`, 'content-type': 'video/mp4', 'x-file-name': 'clip.mp4', 'transfer-encoding': 'chunked',
+  } }, (incoming) => {
+    const chunks = [];
+    incoming.on('data', (chunk) => chunks.push(chunk));
+    incoming.on('end', () => resolveResponse({ status: incoming.statusCode, body: Buffer.concat(chunks).toString() }));
+  });
+  request.on('error', rejectResponse);
+  t.after(async () => { request.destroy(); await response.catch(() => {}); });
+  return { request, response };
+}
+
+test('视频上传流逐块写盘并在空文件、超限和中断时删除临时文件', async () => {
+  const directory = await mkdtemp(join(dataDir, 'stream-'));
+  const temporaryPath = join(directory, 'valid.upload');
+  const uploaded = await streamVideoUpload({ request: Readable.from([mp4Bytes.subarray(0, 3), mp4Bytes.subarray(3)]), temporaryPath, maxBytes: 20 });
+  assert.equal(uploaded.size, 20);
+  assert.deepEqual(uploaded.headerBytes, Buffer.from([0, 0, 0, 24, ...Buffer.from('ftyp')]));
+  assert.deepEqual(await fs.readFile(temporaryPath), mp4Bytes);
+  for (const [name, chunks, maxBytes, statusCode] of [['empty', [], 20, 400], ['large', [mp4Bytes.subarray(0, 8), mp4Bytes.subarray(8)], 19, 413]]) {
+    await assert.rejects(streamVideoUpload({ request: Readable.from(chunks), temporaryPath: join(directory, `${name}.upload`), maxBytes }), (error) => error.statusCode === statusCode);
+    assert.equal((await readdir(directory)).includes(`${name}.upload`), false);
+  }
+  const interrupted = new PassThrough();
+  const pending = streamVideoUpload({ request: interrupted, temporaryPath: join(directory, 'aborted.upload'), maxBytes: 20 });
+  interrupted.write(mp4Bytes.subarray(0, 5));
+  interrupted.destroy(new Error('连接中断'));
+  await assert.rejects(pending);
+  assert.equal((await readdir(directory)).includes('aborted.upload'), false);
+});
+
+test('视频上传验证主机凭证、格式及失败原子性', async (t) => {
+  const { host, hostToken, roomId, members: [member] } = await createRoomWithMembers(1);
+  t.after(() => { host.close(); member.close(); });
+  assert.equal((await uploadVideo(roomId, hostToken, mp4Bytes, { authorization: '' })).status, 401);
+  assert.equal((await uploadVideo(roomId, 'wrong-token')).status, 403);
+  const uploaded = await uploadVideo(roomId, hostToken);
+  assert.equal(uploaded.status, 200);
+  const { source } = await uploaded.json();
+  assert.equal(source.kind, 'video');
+  assert.equal(source.fileName, '排练.mp4');
+  assert.equal(source.mimeType, 'video/mp4');
+  assert.equal(source.size, mp4Bytes.length);
+  assert.equal('storagePath' in source, false);
+  assert.deepEqual((await host.next('source:loaded')).source, source);
+  assert.deepEqual((await member.next('source:loaded')).source, source);
+  const cases = [
+    [Buffer.alloc(0), {}, 400],
+    [mp4Bytes, { 'content-type': 'application/octet-stream' }, 400],
+    [mp4Bytes, { 'x-file-name': 'clip.mkv' }, 400],
+    [mp4Bytes, { 'x-file-name': '%broken' }, 400],
+    [Buffer.from('invalid video bytes'), {}, 400],
+    [mp4Bytes, { 'content-length': String(2 * 1024 * 1024 * 1024 + 1) }, 413],
+  ];
+  for (const [body, headers, status] of cases) {
+    // 超大 Content-Length 使用原始 HTTP，避免 fetch 先拒绝声明长度与正文不符。
+    const response = headers['content-length'] ? await new Promise((resolve, reject) => {
+      const request = http.request(`${origin}/api/rooms/${roomId}/video`, { method: 'POST', agent: false, headers: {
+        authorization: `Bearer ${hostToken}`, 'content-type': 'video/mp4', 'x-file-name': 'clip.mp4', ...headers,
+      } }, (incoming) => { incoming.resume(); incoming.on('end', () => resolve({ status: incoming.statusCode })); });
+      request.on('error', reject); request.end(body);
+    }) : await uploadVideo(roomId, hostToken, body, headers);
+    assert.equal(response.status, status);
+    assert.equal((await fetch(`${origin}/api/rooms/${roomId}/video/${source.id}`)).status, 200);
+    assert.equal((await videoFiles()).some((name) => name.endsWith('.upload')), false);
+  }
+  const webm = await uploadVideo(roomId, hostToken, webmBytes, { 'content-type': 'video/webm', 'x-file-name': 'take.webm' });
+  assert.equal(webm.status, 200);
+  assert.equal((await webm.json()).source.mimeType, 'video/webm');
+});
+
+test('视频上传允许未知长度、断开清理并由最后开始的请求胜出', async (t) => {
+  const { host, hostToken, roomId } = await createRoomWithMembers(0);
+  t.after(() => host.close());
+  const first = beginChunkedUpload(roomId, hostToken, t);
+  first.request.write(mp4Bytes.subarray(0, 8));
+  await waitForUploadFile();
+  const newest = await uploadVideo(roomId, hostToken);
+  assert.equal(newest.status, 200);
+  const { source } = await newest.json();
+  first.request.end(mp4Bytes.subarray(8));
+  assert.equal((await first.response).status, 409);
+  assert.equal((await videoFiles()).filter((name) => name.includes(roomId)).length, 1);
+  const interrupted = beginChunkedUpload(roomId, hostToken, t);
+  const disconnected = interrupted.response.catch(() => {});
+  interrupted.request.write(mp4Bytes.subarray(0, 8));
+  await waitForUploadFile();
+  interrupted.request.destroy();
+  await disconnected;
+  for (let attempt = 0; attempt < 100 && (await videoFiles()).some((name) => name.endsWith('.upload')); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal((await videoFiles()).some((name) => name.endsWith('.upload')), false);
+  assert.equal((await fetch(`${origin}/api/rooms/${roomId}/video/${source.id}`)).status, 200);
+  const unknown = beginChunkedUpload(roomId, hostToken, t);
+  unknown.request.write(mp4Bytes.subarray(0, 5));
+  unknown.request.end(mp4Bytes.subarray(5));
+  assert.equal((await unknown.response).status, 200);
+  const empty = beginChunkedUpload(roomId, hostToken, t);
+  empty.request.end();
+  assert.equal((await empty.response).status, 400);
+  assert.equal((await videoFiles()).some((name) => name.endsWith('.upload')), false);
+});
+
+test('视频 Range 读取返回精确字节和响应头，陈旧来源失效且已开始读取安全结束', async (t) => {
+  const { host, hostToken, roomId } = await createRoomWithMembers(0);
+  t.after(() => host.close());
+  const { source } = await (await uploadVideo(roomId, hostToken)).json();
+  const url = `${origin}/api/rooms/${roomId}/video/${source.id}`;
+  for (const [range, status, expected, contentRange] of [
+    [undefined, 200, mp4Bytes, null],
+    ['bytes=4-7', 206, Buffer.from('ftyp'), 'bytes 4-7/20'],
+    ['bytes=-4', 206, Buffer.from('4567'), 'bytes 16-19/20'],
+  ]) {
+    const response = await fetch(url, { headers: range ? { range } : {} });
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get('content-range'), contentRange);
+    assert.equal(response.headers.get('content-length'), String(expected.length));
+    assert.equal(response.headers.get('accept-ranges'), 'bytes');
+    assert.equal(response.headers.get('content-type'), 'video/mp4');
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), expected);
+  }
+  for (const range of ['bytes=0-1,4-5', 'bytes=20-', 'bytes=8-7']) {
+    const response = await fetch(url, { headers: { range } });
+    assert.equal(response.status, 416);
+    assert.equal(response.headers.get('content-range'), 'bytes */20');
+    assert.doesNotMatch(await response.text(), /storagePath|band-room-test/);
+  }
+  assert.equal((await fetch(`${origin}/api/rooms/${roomId}/video/wrong-source`)).status, 404);
+  const large = Buffer.concat([mp4Bytes, Buffer.alloc(4 * 1024 * 1024, 0x63)]);
+  const second = (await (await uploadVideo(roomId, hostToken, large)).json()).source;
+  assert.equal((await fetch(url)).status, 404);
+  const incoming = await new Promise((resolve, reject) => {
+    http.get(`${origin}/api/rooms/${roomId}/video/${second.id}`, (response) => { response.pause(); resolve(response); }).on('error', reject);
+  });
+  t.after(() => incoming.destroy());
+  host.send({ type: 'score:upload', hostToken, upload: fakeScoreBuffer(64) });
+  await host.next('source:loaded', (event) => event.source.kind === 'score');
+  assert.equal((await fetch(`${origin}/api/rooms/${roomId}/video/${second.id}`)).status, 404);
+  const completed = await new Promise((resolve, reject) => {
+    const chunks = [];
+    incoming.on('data', (chunk) => chunks.push(chunk));
+    incoming.on('end', () => resolve(Buffer.concat(chunks)));
+    incoming.on('error', reject);
+    incoming.resume();
+  });
+  assert.deepEqual(completed, large);
+});
+
+test('视频时长仅允许主机登记当前来源，校验时长并裁剪播放位置至结尾暂停', async (t) => {
+  const { host, hostToken, roomId, members: [member] } = await createRoomWithMembers(1);
+  t.after(() => { host.close(); member.close(); });
+  const { source } = await (await uploadVideo(roomId, hostToken)).json();
+  await host.next('source:loaded');
+  await member.next('source:loaded');
+  member.send({ type: 'source:set-duration', hostToken, sourceId: source.id, durationMs: 1000 });
+  assert.equal((await member.next('error')).code, 'HOST_AUTH_INVALID');
+  host.send({ type: 'source:set-duration', hostToken: 'wrong', sourceId: source.id, durationMs: 1000 });
+  assert.equal((await host.next('error')).code, 'HOST_AUTH_INVALID');
+  for (const patch of [{ sourceId: 'stale' }, { durationMs: NaN }, { durationMs: 0 }, { durationMs: -1 }, { durationMs: 86_400_001 }, { durationMs: '1000' }]) {
+    host.send({ type: 'source:set-duration', hostToken, sourceId: source.id, durationMs: 1000, ...patch });
+    await host.next('error');
+  }
+  host.send({ type: 'source:set-duration', hostToken, sourceId: source.id, durationMs: 86_400_000 });
+  assert.equal((await host.next('source:loaded')).source.durationMs, 86_400_000);
+  await member.next('source:loaded');
+  host.send({ type: 'source:set-duration', hostToken, sourceId: source.id, durationMs: 250 });
+  const registered = (await host.next('source:loaded')).source;
+  assert.equal(registered.durationMs, 250);
+  assert.equal(registered.id, source.id);
+  assert.equal('storagePath' in registered, false);
+  assert.deepEqual((await member.next('source:loaded')).source, registered);
+  host.send({ type: 'playback:control', hostToken, action: 'seek', positionMs: 500 });
+  const clamped = (await member.next('playback:state', (event) => event.playback.positionMs === 250)).playback;
+  assert.equal(clamped.isPlaying, false);
+  assert.equal(clamped.serverTick, 0);
+  host.send({ type: 'playback:control', hostToken, action: 'seek', positionMs: 230 });
+  await member.next('playback:state', (event) => event.playback.positionMs === 230);
+  host.send({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true });
+  const ended = await member.next('playback:state', (event) => event.playback.positionMs === 250 && !event.playback.isPlaying && event.playback.revision > clamped.revision);
+  assert.equal(ended.playback.positionMs, 250);
+  host.send({ type: 'room:resume', roomId, hostToken, clientId: 'duration-resume' });
+  assert.equal((await host.next('room:joined')).source.durationMs, 250);
 });
 
 test('停机等待来源替换触发的 EBUSY 重试完成', async (t) => {

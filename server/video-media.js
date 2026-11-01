@@ -1,4 +1,8 @@
 import path from 'node:path';
+import { createWriteStream } from 'node:fs';
+import { rm } from 'node:fs/promises';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 export const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024;
 
@@ -76,4 +80,41 @@ export function parseSingleRange(rangeHeader, size) {
     end = Math.min(end, size - 1);
   }
   return { start, end, length: end - start + 1 };
+}
+
+export async function streamVideoUpload({ request, temporaryPath, maxBytes = MAX_VIDEO_BYTES }) {
+  let size = 0;
+  let headerBytes = Buffer.alloc(0);
+  const counter = new Transform({
+    transform(chunk, _encoding, callback) {
+      size += chunk.length;
+      if (size > maxBytes) {
+        callback(Object.assign(new VideoMediaError('视频文件不能超过 2 GiB。'), { statusCode: 413 }));
+        return;
+      }
+      if (headerBytes.length < 8) headerBytes = Buffer.concat([headerBytes, chunk.subarray(0, 8 - headerBytes.length)]);
+      callback(null, chunk);
+    },
+    flush(callback) {
+      callback(size ? null : Object.assign(new VideoMediaError('视频文件不能为空。'), { statusCode: 400 }));
+    },
+  });
+  const abort = (error) => counter.destroy(error instanceof Error ? error : new VideoMediaError('视频上传已中断。'));
+  request.on('aborted', abort);
+  request.on('error', abort);
+  try {
+    const completed = pipeline(counter, createWriteStream(temporaryPath, { flags: 'wx' }));
+    request.pipe(counter);
+    if (request.aborted || request.destroyed) abort();
+    await completed;
+    return { size, headerBytes };
+  } catch (error) {
+    request.unpipe(counter);
+    request.resume();
+    await rm(temporaryPath, { force: true });
+    throw error;
+  } finally {
+    request.off('aborted', abort);
+    request.off('error', abort);
+  }
 }

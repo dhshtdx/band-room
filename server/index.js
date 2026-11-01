@@ -1,5 +1,8 @@
 import crypto from 'node:crypto';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { createReadStream } from 'node:fs';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { pipeline } from 'node:stream/promises';
 import os from 'node:os';
 import { basename, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +10,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import { importer, midi } from '@coderline/alphatab';
 import QRCode from 'qrcode';
+import { MAX_VIDEO_BYTES, VideoMediaError, RangeNotSatisfiableError, validateVideoDescriptor, hasValidVideoSignature, parseSingleRange, streamVideoUpload } from './video-media.js';
 
 const rootDir = fileURLToPath(new URL('..', import.meta.url));
 const packageMetadata = JSON.parse(await readFile(join(rootDir, 'package.json'), 'utf8'));
@@ -16,6 +20,8 @@ const port = Number(process.env.PORT ?? 4173);
 // 把临时曲谱放到系统用户数据目录；命令行开发模式仍沿用 work/scores。
 const dataDir = process.env.BAND_ROOM_DATA_DIR || join(rootDir, 'work');
 const scoresDir = join(dataDir, 'scores');
+const videosDir = join(dataDir, 'videos');
+const pendingVideoUploads = new Map();
 const allowedInstruments = ['guitar', 'bass', 'drums', 'keys', 'vocals', 'other'];
 const allowedScoreExtensions = new Set(['.gp', '.gp3', '.gp4', '.gp5', '.gpx']);
 const rooms = new Map();
@@ -26,7 +32,7 @@ function lanAddresses() { return Object.values(os.networkInterfaces()).flat().fi
 
 function createRoom() {
   let id; do { id = crypto.randomInt(1_000_000, 10_000_000).toString(); } while (rooms.has(id));
-  const room = { id, hostToken: crypto.randomBytes(24).toString('base64url'), members: new Set(), source: null, cleanupTimer: null, playback: { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: 0 } };
+  const room = { id, hostToken: crypto.randomBytes(24).toString('base64url'), members: new Set(), uploadRevision: 0, source: null, cleanupTimer: null, playback: { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: 0 } };
   rooms.set(id, room); return room;
 }
 function members(room) { return [...room.members].map((socket) => ({ name: socket.member.name, instrument: socket.member.instrument })); }
@@ -161,6 +167,54 @@ app.use((_request, response, next) => {
   });
   next();
 });
+async function receiveVideo(request, response) {
+  const room = rooms.get(request.params.roomId);
+  if (!room) return response.status(404).json({ message: '排练房间不存在或已过期。' });
+  const authorization = request.get('authorization');
+  const bearer = /^Bearer (\S+)$/.exec(authorization ?? '');
+  if (!bearer) return response.status(401).json({ message: '需要主机控制凭证。' });
+  if (bearer[1] !== room.hostToken) return response.status(403).json({ message: '主机控制凭证无效。' });
+  const revision = ++room.uploadRevision;
+  const sourceId = crypto.randomUUID();
+  const temporaryPath = join(videosDir, `${room.id}-${sourceId}.upload`);
+  let storagePath;
+  try {
+    const lengthHeader = request.get('content-length');
+    const contentLength = lengthHeader === undefined ? undefined : Number(lengthHeader);
+    if (contentLength > MAX_VIDEO_BYTES) return response.status(413).json({ message: '视频文件不能超过 2 GiB。' });
+    let fileName;
+    try { fileName = decodeURIComponent(request.get('x-file-name') ?? ''); }
+    catch { throw new VideoMediaError('视频文件名编码无效。'); }
+    const descriptor = validateVideoDescriptor({ fileName, mimeType: request.get('content-type'), contentLength });
+    await mkdir(videosDir, { recursive: true });
+    const { size, headerBytes } = await streamVideoUpload({ request, temporaryPath, maxBytes: MAX_VIDEO_BYTES });
+    if (!hasValidVideoSignature(descriptor.mimeType, headerBytes)) throw new VideoMediaError('视频文件标识无效。');
+    if (stopping || rooms.get(room.id) !== room || room.uploadRevision !== revision) {
+      await rm(temporaryPath, { force: true });
+      return response.status(409).json({ message: '此上传已被新的播放源替换。' });
+    }
+    storagePath = join(videosDir, `${room.id}-${sourceId}${descriptor.extension}`);
+    await rename(temporaryPath, storagePath);
+    // rename 是异步边界，新请求可能已占用下一代次。
+    if (stopping || rooms.get(room.id) !== room || room.uploadRevision !== revision) {
+      await rm(storagePath, { force: true });
+      return response.status(409).json({ message: '此上传已被新的播放源替换。' });
+    }
+    const source = { kind: 'video', id: sourceId, fileName: descriptor.fileName, mimeType: descriptor.mimeType, size, storagePath };
+    replaceSource(room, source);
+    response.json({ source: publicSource(source) });
+  } catch (error) {
+    await rm(temporaryPath, { force: true });
+    if (storagePath) await rm(storagePath, { force: true });
+    if (!response.destroyed && !response.headersSent) response.status(error.statusCode === 413 ? 413 : error instanceof VideoMediaError ? 400 : 500).json({ message: error instanceof VideoMediaError ? error.message : '视频上传失败。' });
+  }
+}
+app.post('/api/rooms/:roomId/video', (request, response) => {
+  if (stopping) return response.status(503).json({ message: '服务器正在停止。' });
+  const task = receiveVideo(request, response);
+  pendingVideoUploads.set(request, task);
+  task.finally(() => pendingVideoUploads.delete(request)).catch(reportSourceCleanupError);
+});
 app.use(express.json({ limit: '22mb' }));
 // 将 AlphaTab 的 ESM、字体和 worker 作为本地静态资源提供，局域网客户端无需联网。
 app.use('/alphatab', express.static(alphaTabDistDir, { cacheControl: true, maxAge: '1d' }));
@@ -180,6 +234,33 @@ app.get('/api/qrcode', async (request, response) => {
   response.json({ dataUrl: await QRCode.toDataURL(target.href, { width: 260, margin: 1 }) });
 });
 app.get('/api/rooms/:roomId/score/:sourceId', async (request, response) => { const source = rooms.get(request.params.roomId)?.source; if (source?.kind !== 'score' || source.id !== request.params.sourceId || !source.storagePath) return response.status(404).json({ message: '此曲谱来源已失效或尚未加载。' }); response.type('application/octet-stream').send(await readFile(source.storagePath)); });
+app.get('/api/rooms/:roomId/video/:sourceId', async (request, response) => {
+  const source = rooms.get(request.params.roomId)?.source;
+  if (source?.kind !== 'video' || source.id !== request.params.sourceId || !source.storagePath) return response.status(404).json({ message: '此视频来源已失效或尚未加载。' });
+  try {
+    const { size } = await stat(source.storagePath);
+    let range;
+    try { range = parseSingleRange(request.get('range'), size); }
+    catch (error) {
+      if (!(error instanceof RangeNotSatisfiableError)) throw error;
+      return response.status(416).set('Content-Range', `bytes */${size}`).json({ message: error.message });
+    }
+    const stream = createReadStream(source.storagePath, range ? { start: range.start, end: range.end } : {});
+    // 在返回响应头前打开句柄；来源替换删除路径后，已开始的读取仍持有文件。
+    await once(stream, 'open');
+    if (response.destroyed) { stream.destroy(); return; }
+    response.status(range ? 206 : 200).set({
+      'Content-Type': source.mimeType,
+      'Content-Length': String(range?.length ?? size),
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-store',
+      ...(range ? { 'Content-Range': `bytes ${range.start}-${range.end}/${size}` } : {}),
+    });
+    await pipeline(stream, response);
+  } catch (error) {
+    if (!response.headersSent && !response.destroyed) response.status(error.code === 'ENOENT' ? 404 : 500).json({ message: '无法读取此视频来源。' });
+  }
+});
 const server = app.listen(port, '0.0.0.0');
 export const serverReady = new Promise((resolve, reject) => {
   server.once('listening', () => {
@@ -208,6 +289,16 @@ wss.on('connection', (socket) => socket.on('message', async (raw) => {
   const room = socket.member?.roomId && rooms.get(socket.member.roomId);
   if (event.type === 'playback:request-state') { if (room) socket.send(JSON.stringify({ type: 'playback:state', playback: playbackState(room) })); return; }
   if (event.type === 'score:upload') { if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; } try { replaceSource(room, await storeAndParseScore(room, event.upload ?? {})); } catch (error) { socket.send(JSON.stringify({ type: 'error', message: error.message })); } return; }
+  if (event.type === 'source:set-duration') {
+    if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; }
+    if (room.source?.kind !== 'video' || event.sourceId !== room.source.id || !Number.isFinite(event.durationMs) || event.durationMs <= 0 || event.durationMs > 86_400_000) {
+      socket.send(JSON.stringify({ type: 'error', message: '视频来源或时长无效。' })); return;
+    }
+    room.source.durationMs = event.durationMs;
+    broadcast(room, { type: 'source:loaded', source: publicSource(room.source) });
+    updatePlayback(room, {});
+    return;
+  }
   if (event.type === 'playback:control') { if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; } if (event.action === 'set-playing' && typeof event.isPlaying === 'boolean') updatePlayback(room, { isPlaying: event.isPlaying }); if (event.action === 'seek') updatePlayback(room, { positionMs: Number(event.positionMs) }); if (event.action === 'seek-tick') updatePlayback(room, { positionMs: tickToPosition(room.source?.kind === 'score' ? room.source : null, Math.max(0, Number(event.tick) || 0)) }); return; }
   if (event.type !== 'room:join') return;
   const roomId = String(event.roomId ?? ''); const targetRoom = rooms.get(roomId); const name = String(event.name ?? '').trim().slice(0, 24); const instrument = String(event.instrument ?? 'other');
@@ -236,6 +327,8 @@ export async function stopBandRoomServer() {
   stopping = true;
   clearInterval(playbackTicker);
   clearInterval(heartbeat);
+  for (const request of pendingVideoUploads.keys()) request.destroy();
+  await Promise.allSettled([...pendingVideoUploads.values()]);
   const sources = [];
   for (const room of rooms.values()) {
     cancelRoomCleanup(room);
