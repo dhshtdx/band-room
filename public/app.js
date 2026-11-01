@@ -1,4 +1,5 @@
 import * as alphaTab from '/alphatab/alphaTab.mjs';
+import { applyMemberScorePlayback, attachSilentExternalMedia } from '/member-score-sync.js?v=native-member-cursor-1';
 import { targetVideoPositionMs, decideVideoSync, VIDEO_SYNC } from '/video-sync.js?v=local-video-1';
 
 const $ = (selector) => document.querySelector(selector);
@@ -19,7 +20,7 @@ let clientId = readSession(clientIdKey);
 if (!clientId) { clientId = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`; writeSession(clientIdKey, clientId); }
 let resumeInfo = (() => { try { return JSON.parse(readSession(resumeKey) || 'null'); } catch { return null; } })();
 if (pageRole === 'member' && requestedRoomId && resumeInfo?.roomId !== requestedRoomId) { resumeInfo = null; writeSession(resumeKey, null); }
-let socket = null; let reconnectTimer = null; let reconnectAttempt = 0; let memberIdentity = pageRole === 'member' ? resumeInfo : null; let isHost = false; let roomId = null; let hostToken = null; let source = null; let selectedTrack = 0; let lastKnownPlaying = null; let latestPlayback = null; let controlPending = false; let pendingPlaybackTarget = null; let explicitlyPaused = false; let alphaTabApi = null; let audioReady = false; let audioLoading = false; let audioNoteEvents = 0; let audioPlayerState = alphaTab.synth.PlayerState.Paused; let audioLoadTimer = null; let audioStatusTimer = null; let playAfterAudioReady = false; let followerCursor = null; let followerBuildTimer = null; let lastPlaybackMessageAt = null; let scoreClickHandler = null; const runtimeErrors = [];
+let socket = null; let reconnectTimer = null; let reconnectAttempt = 0; let memberIdentity = pageRole === 'member' ? resumeInfo : null; let isHost = false; let roomId = null; let hostToken = null; let source = null; let selectedTrack = 0; let lastKnownPlaying = null; let latestPlayback = null; let controlPending = false; let pendingPlaybackTarget = null; let explicitlyPaused = false; let alphaTabApi = null; let memberScorePlaying = null; let audioReady = false; let audioLoading = false; let audioNoteEvents = 0; let audioPlayerState = alphaTab.synth.PlayerState.Paused; let audioLoadTimer = null; let audioStatusTimer = null; let playAfterAudioReady = false; let lastPlaybackMessageAt = null; let scoreClickHandler = null; const runtimeErrors = [];
 function persistResume(value) { resumeInfo = value; writeSession(resumeKey, value ? JSON.stringify(value) : null); }
 function positionForTick(tick) {
   const points = source?.tempoMap ?? []; let point = points[0] ?? null;
@@ -32,10 +33,12 @@ function initializeAlphaTab() {
   if (scoreClickHandler) scoreElement.removeEventListener('click', scoreClickHandler);
   scoreClickHandler = null;
   if (alphaTabApi) alphaTabApi.destroy();
+  memberScorePlaying = null;
   audioReady = false; audioLoading = false; audioNoteEvents = 0; audioPlayerState = alphaTab.synth.PlayerState.Paused; playAfterAudioReady = false; clearTimeout(audioLoadTimer); clearTimeout(audioStatusTimer); audioStatusTimer = null;
-  alphaTabApi = new alphaTab.AlphaTabApi(scoreElement, { core: { fontDirectory: '/alphatab/font/', scriptFile: `${location.origin}/alphatab/alphaTab.mjs`, useWorkers: true }, display: { layoutMode: alphaTab.LayoutMode.Horizontal, scale: 1 }, player: { enablePlayer: isHost, playerMode: alphaTab.PlayerMode.EnabledSynthesizer, soundFont: isHost ? '/alphatab/soundfont/sonivox.sf2' : null, enableCursor: isHost, enableElementHighlighting: isHost, scrollMode: alphaTab.ScrollMode.OffScreen, nativeBrowserSmoothScroll: true, scrollElement: document.documentElement } });
-  alphaTabApi.renderStarted.on(() => { $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在排版谱面…'; scheduleFollowerBuild(); });
-  alphaTabApi.renderFinished.on(() => { clearTimeout(renderTimeout); $('#render-status').classList.add('hidden'); $('#alpha-tab').classList.remove('hidden'); if (isHost) { ensureHostAudioMix(); $('#toggle-play').disabled = false; resumeIfServerPlaying(); } scheduleFollowerBuild(); });
+  alphaTabApi = new alphaTab.AlphaTabApi(scoreElement, { core: { fontDirectory: '/alphatab/font/', scriptFile: `${location.origin}/alphatab/alphaTab.mjs`, useWorkers: true }, display: { layoutMode: alphaTab.LayoutMode.Horizontal, scale: 1 }, player: { enablePlayer: true, playerMode: isHost ? alphaTab.PlayerMode.EnabledSynthesizer : alphaTab.PlayerMode.EnabledExternalMedia, soundFont: isHost ? '/alphatab/soundfont/sonivox.sf2' : null, enableCursor: true, enableElementHighlighting: true, enableAnimatedBeatCursor: true, enableUserInteraction: isHost, scrollMode: alphaTab.ScrollMode.OffScreen, nativeBrowserSmoothScroll: true, scrollElement: isHost ? document.documentElement : scoreElement } });
+  const api = alphaTabApi; const sourceId = source?.id;
+  alphaTabApi.renderStarted.on(() => { $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在排版谱面…'; });
+  alphaTabApi.renderFinished.on(() => { clearTimeout(renderTimeout); $('#render-status').classList.add('hidden'); $('#alpha-tab').classList.remove('hidden'); if (isHost) { ensureHostAudioMix(); $('#toggle-play').disabled = false; resumeIfServerPlaying(); } });
   alphaTabApi.error.on((error) => { clearTimeout(renderTimeout); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = `AlphaTab 渲染失败：${error.message ?? '未知错误'}`; reportRuntimeError('AlphaTab', error); });
   if (isHost) {
     scoreClickHandler = (event) => {
@@ -67,9 +70,35 @@ function initializeAlphaTab() {
     alphaTabApi.soundFontLoadFailed?.on((error) => { audioReady = false; audioLoading = false; playAfterAudioReady = false; clearTimeout(audioLoadTimer); $('#prepare-audio').disabled = false; $('#prepare-audio').textContent = '重试准备伴奏'; $('#audio-status').textContent = `伴奏音色加载失败：${error.message ?? '未知错误'}`; reportRuntimeError('SoundFont', error); });
     alphaTabApi.playerReady?.on(() => { ensureHostAudioMix(); refreshHostAudioStatus('播放器与 MIDI 已就绪'); startAfterAudioReady(); if (isHost) resumeIfServerPlaying(); });
     alphaTabApi.playerStateChanged?.on((event) => { audioPlayerState = event.state ?? event; refreshHostAudioStatus(); });
+  } else {
+    alphaTabApi.playerReady?.on(() => {
+      if (alphaTabApi !== api || pageRole !== 'member' || isHost || source?.kind !== 'score' || source.id !== sourceId) return;
+      initializeMemberScorePlayer(api);
+    });
   }
 }
 function reportRuntimeError(source, error) { const detail = error?.message || String(error); runtimeErrors.unshift(`${new Date().toLocaleTimeString()} [${source}] ${detail}`); $('#runtime-errors-text').textContent = runtimeErrors.slice(0, 8).join('\n'); $('#runtime-errors').classList.remove('hidden'); }
+function initializeMemberScorePlayer(api) {
+  if (pageRole !== 'member' || isHost || source?.kind !== 'score' || alphaTabApi !== api) return false;
+  try {
+    const attached = attachSilentExternalMedia(api, source.durationMs);
+    if (!attached) throw new Error('Member score sync requires an initialized AlphaTab player');
+    syncMemberScorePlayback(latestPlayback);
+    return true;
+  } catch (error) {
+    reportRuntimeError('MemberScoreSync', error);
+    return false;
+  }
+}
+function syncMemberScorePlayback(playback) {
+  if (!playback || pageRole !== 'member' || isHost || source?.kind !== 'score' || !alphaTabApi) return;
+  try {
+    const result = applyMemberScorePlayback(alphaTabApi, playback, memberScorePlaying);
+    if (result.applied) memberScorePlaying = result.isPlaying;
+  } catch (error) {
+    reportRuntimeError('MemberScoreSync', error);
+  }
+}
 function ensureHostAudioMix() { if (!isHost || !alphaTabApi) return; alphaTabApi.masterVolume = 1; if (alphaTabApi.score?.tracks?.length) { alphaTabApi.changeTrackSolo([-1], false); alphaTabApi.changeTrackMute([-1], false); alphaTabApi.changeTrackVolume([-1], 1); } }
 function refreshHostAudioStatus(prefix = '') { if (!isHost) return; const state = audioPlayerState === alphaTab.synth.PlayerState.Playing ? '播放中' : '已暂停'; $('#audio-status').classList.remove('hidden'); if (!debugMode) { $('#audio-status').textContent = audioReady ? (state === '播放中' ? '伴奏播放中' : '伴奏已就绪') : audioLoading ? '正在准备伴奏…' : '尚未准备伴奏'; return; } const contextState = alphaTabApi?.player?.output?.context?.state ?? '初始化中'; const details = [`音色${audioReady ? '已加载' : audioLoading ? '加载中' : '未加载'}`, `播放器${state}`, `AudioContext ${contextState}`, `主音量 ${alphaTabApi?.masterVolume ?? 0}`, `MIDI 音符 ${audioNoteEvents}`]; $('#audio-status').textContent = [prefix, ...details].filter(Boolean).join(' · '); }
 function scheduleHostAudioStatus() { if (audioStatusTimer) return; audioStatusTimer = setTimeout(() => { audioStatusTimer = null; refreshHostAudioStatus(); }, 250); }
@@ -92,50 +121,27 @@ async function renderJoinAccess(nextRoomId) {
   try { const result = await fetch(`/api/qrcode?url=${encodeURIComponent(joinUrl)}`, { cache: 'no-store' }).then((response) => response.json()); if (!result.dataUrl) throw new Error('二维码数据为空'); qr.src = result.dataUrl; qr.classList.remove('hidden'); } catch (error) { qr.classList.add('hidden'); reportRuntimeError('QRCode', error); }
 }
 function formatPosition(ms) { return `${String(Math.floor(ms / 60000)).padStart(2, '0')}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}.${String(ms % 1000).padStart(3, '0')}`; }
-function updateSyncDebug({ playback, tick = null, match = null, cursor = null, issue = '' }) { if (isHost) return; const alphaPlayerState = alphaTabApi ? (alphaTabApi.isReadyForPlayback ? 'ready' : 'disabled / not ready') : 'instance missing'; const values = [['WebSocket', socket?.readyState === WebSocket.OPEN ? 'connected' : 'reconnecting'], ['playing', String(playback.isPlaying)], ['serverTick', String(playback.serverTick ?? 'missing')], ['currentTempo', `${playback.currentTempo ?? '—'} BPM`], ['lastReceivedTick', String(playback.serverTick ?? 'missing')], ['currentMeasure', String(playback.measure ?? match?.barIndex + 1 ?? '—')], ['currentBeat', String(playback.beat ?? match?.beatIndex + 1 ?? '—')], ['serverTimestamp', String(playback.timestamp ?? playback.serverNow ?? 'missing')], ['AlphaTab timePosition', String(alphaTabApi?.timePosition ?? 'not exposed')], ['AlphaTab player', alphaPlayerState], ['lastSyncMessage', lastPlaybackMessageAt ? new Date(lastPlaybackMessageAt).toLocaleTimeString() : '未收到'], ['clientTick', tick === null ? '—' : String(Math.round(tick))], ['cursor', cursor ? `x=${Math.round(cursor.x)}, y=${Math.round(cursor.y)}, h=${Math.round(cursor.h)}` : '无'], ['status', issue || 'ok']]; const panel = $('#sync-debug-text'); panel.replaceChildren(...values.flatMap(([term, value]) => { const dt = document.createElement('dt'); dt.textContent = term; const dd = document.createElement('dd'); dd.textContent = value; return [dt, dd]; })); }
-function scheduleFollowerBuild(attempt = 0) { clearTimeout(followerBuildTimer); followerBuildTimer = setTimeout(() => { const ready = buildFollower(); if (!ready && attempt < 20) scheduleFollowerBuild(attempt + 1); }, 500); }
-function buildFollower() {
-  followerCursor = null; $('#sync-cursor')?.remove();
-  const model = alphaTabApi?.score; const lookup = alphaTabApi?.boundsLookup; const track = model?.tracks[selectedTrack];
-  if (!model || !lookup || !track) return false;
-  const uniqueBeats = new Map();
-  const timeline = source?.playbackTimeline?.length ? source.playbackTimeline : model.masterBars.map((bar, barIndex) => ({ barIndex, startTick: bar.start }));
-  for (const playedBar of timeline) for (const staff of track.staves) {
-    const bar = staff.bars[playedBar.barIndex]; if (!bar) continue;
-    for (const voice of bar.voices) for (const beat of voice.beats) {
-      const bounds = lookup.findBeat(beat); const tick = playedBar.startTick + beat.playbackStart;
-      if (bounds && Number.isFinite(tick) && !uniqueBeats.has(tick)) uniqueBeats.set(tick, { tick, bounds, barIndex: bar.index, beatIndex: beat.index, occurrence: playedBar.occurrence ?? 0 });
-    }
-  }
-  const beats = [...uniqueBeats.values()].sort((a, b) => a.tick - b.tick); if (!beats.length) return false;
-  const node = document.createElement('div'); node.id = 'sync-cursor'; node.hidden = true;
-  const scoreSurface = $('#alpha-tab .at-surface') || $('#alpha-tab'); $('#alpha-tab').append(node);
-  followerCursor = { beats, tempo: model.tempo || 120, node, scoreSurface, lastScrollAt: 0 };
-  if (latestPlayback) { updateSyncDebug({ playback: latestPlayback, issue: `已建立 ${beats.length} 个展开拍点` }); updateFollower(latestPlayback.positionMs, latestPlayback); }
-  return true;
-}
-function followFollowerCursor(scoreX) { const scroller = $('#alpha-tab'); const targetLeft = Math.max(0, Math.min(scroller.scrollWidth - scroller.clientWidth, scoreX - scroller.clientWidth * 0.35)); scroller.scrollLeft = targetLeft; }
-function updateFollower(positionMs, playback) { if (!followerCursor || !followerCursor.node.isConnected) { scheduleFollowerBuild(); return updateSyncDebug({ playback, issue: '正在重新挂载同步游标' }); } const tick = playback.serverTick ?? Math.round(positionMs * followerCursor.tempo * 960 / 60000); let low = 0; let high = followerCursor.beats.length - 1; let match = null; while (low <= high) { const middle = Math.floor((low + high) / 2); if (followerCursor.beats[middle].tick <= tick) { match = followerCursor.beats[middle]; low = middle + 1; } else high = middle - 1; } if (!match) return updateSyncDebug({ playback, tick, issue: followerCursor.beats.length ? '播放位置在第一拍之前' : '没有可查找的 beat' }); const cursor = { x: match.bounds.onNotesX - 1, y: 0, h: followerCursor.scoreSurface.scrollHeight }; followerCursor.node.style.transform = `translate(${cursor.x}px, ${cursor.y}px)`; followerCursor.node.style.height = `${cursor.h}px`; followerCursor.node.hidden = false; followFollowerCursor(cursor.x); updateSyncDebug({ playback, tick, match, cursor }); }
+function updateSyncDebug({ playback, issue = '' }) { if (isHost) return; const alphaPlayerState = alphaTabApi ? (alphaTabApi.isReadyForPlayback ? 'ready' : 'not ready') : 'instance missing'; const values = [['WebSocket', socket?.readyState === WebSocket.OPEN ? 'connected' : 'reconnecting'], ['playing', String(playback.isPlaying)], ['serverTick', String(playback.serverTick ?? 'missing')], ['currentTempo', `${playback.currentTempo ?? '—'} BPM`], ['lastReceivedTick', String(playback.serverTick ?? 'missing')], ['currentMeasure', String(playback.measure ?? '—')], ['currentBeat', String(playback.beat ?? '—')], ['serverTimestamp', String(playback.timestamp ?? playback.serverNow ?? 'missing')], ['AlphaTab timePosition', String(alphaTabApi?.timePosition ?? 'not exposed')], ['AlphaTab player', alphaPlayerState], ['lastSyncMessage', lastPlaybackMessageAt ? new Date(lastPlaybackMessageAt).toLocaleTimeString() : '未收到'], ['status', issue || 'ok']]; const panel = $('#sync-debug-text'); panel.replaceChildren(...values.flatMap(([term, value]) => { const dt = document.createElement('dt'); dt.textContent = term; const dd = document.createElement('dd'); dd.textContent = value; return [dt, dd]; })); }
 function renderPlayback(playback) {
   latestPlayback = playback; videoReceivedAt = performance.now();
   if (hostVideoPlayIntent && !hostVideoPlayIntent.playPending && playback.isPlaying) hostVideoPlayIntent = null;
   if (pendingPlaybackTarget === null || playback.isPlaying === pendingPlaybackTarget) { controlPending = false; pendingPlaybackTarget = null; }
   const displayedPlaying = pendingPlaybackTarget ?? playback.isPlaying;
-  if (isHost) { $('#toggle-play').disabled = !source; $('#alpha-tab').classList.toggle('host-paused-cursor', !playback.isPlaying); }
+  if (isHost) $('#toggle-play').disabled = !source;
   $('#transport-status').textContent = playback.isPlaying ? '播放中' : '已暂停';
   $('#position').textContent = formatPosition(playback.positionMs);
   $('#toggle-play').textContent = displayedPlaying ? '暂停' : '播放';
   $('#seek-seconds').value = (playback.positionMs / 1000).toFixed(1);
   if (source?.kind === 'video') { $('#toggle-play').disabled = Boolean(videoPlayAttempt && isHost && !hostVideoPlayIntent); applyVideoPlayback(playback); return; }
   if (source?.kind !== 'score' || !alphaTabApi) { if (!isHost) updateSyncDebug({ playback, issue: '等待曲谱加载' }); return; }
+  if (!isHost) { syncMemberScorePlayback(playback); updateSyncDebug({ playback }); return; }
   const playingFlipped = lastKnownPlaying === null || playback.isPlaying !== lastKnownPlaying;
   lastKnownPlaying = playback.isPlaying;
-  if (isHost && playingFlipped && alphaTabApi.isReadyForPlayback) {
+  if (playingFlipped && alphaTabApi.isReadyForPlayback) {
     alphaTabApi.timePosition = playback.positionMs;
     if (audioReady && playback.isPlaying) alphaTabApi.play();
     if (!playback.isPlaying) alphaTabApi.pause();
   }
-  updateFollower(playback.positionMs, playback);
 }
 function resumeIfServerPlaying() { if (!isHost || !alphaTabApi || !latestPlayback || explicitlyPaused) return; if (latestPlayback.isPlaying && audioReady && alphaTabApi.isReadyForPlayback) { alphaTabApi.timePosition = latestPlayback.positionMs; alphaTabApi.play(); } }
 let renderTimeout = null;
@@ -143,7 +149,7 @@ async function loadSelectedTrack() {
   if (source?.kind !== 'score' || !roomId || !alphaTabApi) return;
   const sourceId = source.id; const api = alphaTabApi; const track = selectedTrack;
   const isCurrent = () => source?.id === sourceId && alphaTabApi === api && selectedTrack === track;
-  followerCursor = null; clearTimeout(renderTimeout);
+  memberScorePlaying = null; clearTimeout(renderTimeout);
   $('#alpha-tab').classList.remove('hidden'); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在加载并排版谱面…';
   renderTimeout = setTimeout(() => { $('#render-status').textContent = '排版超过 30 秒：请刷新页面后重试，并检查浏览器控制台错误。'; }, 30000);
   try {
@@ -167,8 +173,8 @@ function renderSource(nextSource) {
   video.pause(); video.removeAttribute('src'); video.load(); video.playbackRate = 1;
   alphaTabApi?.pause(); alphaTabApi?.destroy(); alphaTabApi = null;
   if (scoreClickHandler) $('#alpha-tab').removeEventListener('click', scoreClickHandler);
-  scoreClickHandler = null; clearTimeout(renderTimeout); clearTimeout(followerBuildTimer); clearTimeout(audioLoadTimer); clearTimeout(audioStatusTimer);
-  followerCursor = null; $('#sync-cursor')?.remove(); lastKnownPlaying = null; latestPlayback = null; videoReceivedAt = 0;
+  scoreClickHandler = null; clearTimeout(renderTimeout); clearTimeout(audioLoadTimer); clearTimeout(audioStatusTimer);
+  memberScorePlaying = null; lastKnownPlaying = null; latestPlayback = null; videoReceivedAt = 0;
   audioReady = false; audioLoading = false; explicitlyPaused = false;
   pendingPlaybackTarget = null; controlPending = false; playAfterAudioReady = false;
   $('#alpha-tab').classList.add('hidden'); $('#render-status').classList.add('hidden'); $('#audio-status').classList.add('hidden');
@@ -341,7 +347,7 @@ function connectSocket() {
   current.addEventListener('error', () => reportRuntimeError('WebSocket', '连接发生错误，正在自动重试'));
 }
 window.addEventListener('online', connectSocket);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { connectSocket(); applyVideoPlayback(latestPlayback); if (roomId) message({ type: 'playback:request-state' }); } });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { connectSocket(); if (source?.kind === 'score') syncMemberScorePlayback(latestPlayback); else applyVideoPlayback(latestPlayback); if (roomId) message({ type: 'playback:request-state' }); } });
 $('#create-room').addEventListener('click', () => { if (pageRole === 'host') { persistResume(null); message({ type: 'room:create', clientId }); } });
 $('#join-room').addEventListener('click', () => { if (pageRole === 'member') { memberIdentity = { roomId: $('#room-id').value.replace(/\D/g, ''), name: $('#name').value.trim(), instrument: $('#instrument').value }; message({ type: 'room:join', ...memberIdentity, clientId }); } });
 $('#prepare-audio').addEventListener('click', () => prepareHostAudio(false, true));
@@ -354,7 +360,7 @@ $('#toggle-play').addEventListener('click', async () => {
   requestHostPlayback();
 });
 $('#seek').addEventListener('click', () => { if (!isHost) return; const positionMs = Number($('#seek-seconds').value) * 1000; if (!Number.isFinite(positionMs) || positionMs < 0) return showError('请输入有效的跳转秒数。'); if (source?.kind === 'video' && latestPlayback) applyVideoPlayback({ ...latestPlayback, positionMs }); message({ type: 'playback:control', hostToken, action: 'seek', positionMs }); });
-$('#track-select').addEventListener('change', () => { selectedTrack = Number($('#track-select').value); loadSelectedTrack(); });
+$('#track-select').addEventListener('change', () => { selectedTrack = Number($('#track-select').value); memberScorePlaying = null; loadSelectedTrack(); });
 $('#fullscreen-score').addEventListener('click', async () => { const target = source?.kind === 'video' ? video : $('#alpha-tab'); if (!source || target.classList.contains('hidden')) return showError('请先等待排练内容加载完成。'); try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else document.body.classList.toggle('score-focus'); } catch { document.body.classList.toggle('score-focus'); } syncFullscreenUi(); });
 function syncFullscreenUi() { const active = Boolean(document.fullscreenElement) || document.body.classList.contains('score-focus'); $('#fullscreen-score').textContent = active ? '退出全屏' : source?.kind === 'video' ? '全屏看视频' : '全屏看谱'; $('#fullscreen-exit').classList.toggle('hidden', !active); }
 $('#fullscreen-exit').addEventListener('click', async () => { if (document.fullscreenElement) await document.exitFullscreen(); document.body.classList.remove('score-focus'); syncFullscreenUi(); });
