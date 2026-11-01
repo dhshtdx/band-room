@@ -2,6 +2,7 @@
 .idea/
 .vscode/
 .worktrees/
+worktrees/
 
 # Dependencies and caches
 node_modules/
