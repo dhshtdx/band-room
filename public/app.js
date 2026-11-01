@@ -1,4 +1,5 @@
 import * as alphaTab from '/alphatab/alphaTab.mjs';
+import { targetVideoPositionMs, decideVideoSync, VIDEO_SYNC } from '/video-sync.js?v=local-video-1';
 
 const $ = (selector) => document.querySelector(selector);
 const connection = $('#connection'); const lobby = $('#lobby'); const roomPanel = $('#room'); const notice = $('#notice');
@@ -8,6 +9,8 @@ document.body.dataset.role = pageRole;
 const requestedRoomId = new URLSearchParams(location.search).get('room');
 if (requestedRoomId) $('#room-id').value = requestedRoomId.replace(/\D/g, '').slice(0, 7);
 const resumeKey = `band-room:${pageRole}:resume`;
+const video = $('#video-player');
+let videoReceivedAt = 0; let videoPlayAttempt = null; let videoControlVersion = 0; let videoDurationSent = null; let videoUploading = false;
 const clientIdKey = `band-room:${pageRole}:client-id`;
 function readSession(key) { try { return sessionStorage.getItem(key); } catch { return null; } }
 function writeSession(key, value) { try { if (value === null) sessionStorage.removeItem(key); else sessionStorage.setItem(key, value); } catch { /* Safari 私密模式可能禁用存储，连接本身仍可使用。 */ } }
@@ -112,7 +115,26 @@ function buildFollower() {
 }
 function followFollowerCursor(scoreX) { const scroller = $('#alpha-tab'); const targetLeft = Math.max(0, Math.min(scroller.scrollWidth - scroller.clientWidth, scoreX - scroller.clientWidth * 0.35)); scroller.scrollLeft = targetLeft; }
 function updateFollower(positionMs, playback) { if (!followerCursor || !followerCursor.node.isConnected) { scheduleFollowerBuild(); return updateSyncDebug({ playback, issue: '正在重新挂载同步游标' }); } const tick = playback.serverTick ?? Math.round(positionMs * followerCursor.tempo * 960 / 60000); let low = 0; let high = followerCursor.beats.length - 1; let match = null; while (low <= high) { const middle = Math.floor((low + high) / 2); if (followerCursor.beats[middle].tick <= tick) { match = followerCursor.beats[middle]; low = middle + 1; } else high = middle - 1; } if (!match) return updateSyncDebug({ playback, tick, issue: followerCursor.beats.length ? '播放位置在第一拍之前' : '没有可查找的 beat' }); const cursor = { x: match.bounds.onNotesX - 1, y: 0, h: followerCursor.scoreSurface.scrollHeight }; followerCursor.node.style.transform = `translate(${cursor.x}px, ${cursor.y}px)`; followerCursor.node.style.height = `${cursor.h}px`; followerCursor.node.hidden = false; followFollowerCursor(cursor.x); updateSyncDebug({ playback, tick, match, cursor }); }
-function renderPlayback(playback) { latestPlayback = playback; if (pendingPlaybackTarget === null || playback.isPlaying === pendingPlaybackTarget) { controlPending = false; pendingPlaybackTarget = null; } const displayedPlaying = pendingPlaybackTarget ?? playback.isPlaying; if (isHost) { $('#toggle-play').disabled = false; $('#alpha-tab').classList.toggle('host-paused-cursor', !playback.isPlaying); } $('#transport-status').textContent = playback.isPlaying ? '播放中' : '已暂停'; $('#position').textContent = formatPosition(playback.positionMs); $('#toggle-play').textContent = displayedPlaying ? '暂停' : '播放'; $('#seek-seconds').value = (playback.positionMs / 1000).toFixed(1); if (source?.kind !== 'score' || !alphaTabApi) { if (!isHost) updateSyncDebug({ playback, issue: '等待曲谱加载' }); return; } const playingFlipped = lastKnownPlaying === null || playback.isPlaying !== lastKnownPlaying; lastKnownPlaying = playback.isPlaying; if (isHost && playingFlipped && alphaTabApi.isReadyForPlayback) { alphaTabApi.timePosition = playback.positionMs; if (audioReady && playback.isPlaying) alphaTabApi.play(); if (!playback.isPlaying) alphaTabApi.pause(); } updateFollower(playback.positionMs, playback); }
+function renderPlayback(playback) {
+  latestPlayback = playback; videoReceivedAt = performance.now();
+  if (pendingPlaybackTarget === null || playback.isPlaying === pendingPlaybackTarget) { controlPending = false; pendingPlaybackTarget = null; }
+  const displayedPlaying = pendingPlaybackTarget ?? playback.isPlaying;
+  if (isHost) { $('#toggle-play').disabled = !source; $('#alpha-tab').classList.toggle('host-paused-cursor', !playback.isPlaying); }
+  $('#transport-status').textContent = playback.isPlaying ? '播放中' : '已暂停';
+  $('#position').textContent = formatPosition(playback.positionMs);
+  $('#toggle-play').textContent = displayedPlaying ? '暂停' : '播放';
+  $('#seek-seconds').value = (playback.positionMs / 1000).toFixed(1);
+  if (source?.kind === 'video') { $('#toggle-play').disabled = Boolean(videoPlayAttempt && isHost); applyVideoPlayback(playback); return; }
+  if (source?.kind !== 'score' || !alphaTabApi) { if (!isHost) updateSyncDebug({ playback, issue: '等待曲谱加载' }); return; }
+  const playingFlipped = lastKnownPlaying === null || playback.isPlaying !== lastKnownPlaying;
+  lastKnownPlaying = playback.isPlaying;
+  if (isHost && playingFlipped && alphaTabApi.isReadyForPlayback) {
+    alphaTabApi.timePosition = playback.positionMs;
+    if (audioReady && playback.isPlaying) alphaTabApi.play();
+    if (!playback.isPlaying) alphaTabApi.pause();
+  }
+  updateFollower(playback.positionMs, playback);
+}
 function resumeIfServerPlaying() { if (!isHost || !alphaTabApi || !latestPlayback || explicitlyPaused) return; if (latestPlayback.isPlaying && audioReady && alphaTabApi.isReadyForPlayback) { alphaTabApi.timePosition = latestPlayback.positionMs; alphaTabApi.play(); } }
 let renderTimeout = null;
 async function loadSelectedTrack() {
@@ -133,13 +155,131 @@ async function loadSelectedTrack() {
   }
 }
 function renderSource(nextSource) {
+  const unchanged = nextSource && source?.id === nextSource.id && source?.kind === nextSource.kind;
   source = nextSource;
-  alphaTabApi?.pause(); followerCursor = null; lastKnownPlaying = null;
+  document.body.dataset.source = source?.kind ?? '';
+  if (unchanged) { if (source?.kind === 'video') renderVideoSource(source); return; }
+  if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+  if (!source) document.body.classList.remove('score-focus');
+  videoControlVersion += 1; videoPlayAttempt = null; videoDurationSent = null;
+  video.pause(); video.removeAttribute('src'); video.load(); video.playbackRate = 1;
+  alphaTabApi?.pause(); alphaTabApi?.destroy(); alphaTabApi = null;
+  if (scoreClickHandler) $('#alpha-tab').removeEventListener('click', scoreClickHandler);
+  scoreClickHandler = null; clearTimeout(renderTimeout); clearTimeout(followerBuildTimer); clearTimeout(audioLoadTimer); clearTimeout(audioStatusTimer);
+  followerCursor = null; $('#sync-cursor')?.remove(); lastKnownPlaying = null; latestPlayback = null; videoReceivedAt = 0;
+  audioReady = false; audioLoading = false; explicitlyPaused = false;
   pendingPlaybackTarget = null; controlPending = false; playAfterAudioReady = false;
+  $('#alpha-tab').classList.add('hidden'); $('#render-status').classList.add('hidden'); $('#audio-status').classList.add('hidden');
+  $('#video-player').classList.toggle('hidden', source?.kind !== 'video');
+  $('#media-status').classList.toggle('hidden', source?.kind !== 'video');
+  $('#prepare-audio').classList.toggle('hidden', source?.kind !== 'score');
+  $('#fullscreen-score').classList.toggle('hidden', !source);
+  $('#toggle-play').disabled = !source;
+  if (source?.kind === 'score') initializeAlphaTab();
   renderScoreSource(source?.kind === 'score' ? source : null);
+  $('#score-empty').classList.toggle('hidden', Boolean(source));
+  if (source?.kind === 'video') renderVideoSource(source);
+  syncFullscreenUi();
 }
+
+function setMediaStatus(text) { $('#media-status').textContent = text; $('#media-status').classList.remove('hidden'); }
+function enforceMemberVideoMute() {
+  if (isHost) return;
+  if (!video.muted) video.muted = true;
+  if (!video.defaultMuted) video.defaultMuted = true;
+  if (video.volume !== 0) video.volume = 0;
+}
+function renderVideoSource(nextSource) {
+  enforceMemberVideoMute();
+  const url = `${location.origin}/api/rooms/${encodeURIComponent(roomId)}/video/${encodeURIComponent(nextSource.id)}`;
+  if (video.src !== url) {
+    if (isHost) { video.muted = false; video.defaultMuted = false; video.volume = 1; }
+    video.src = url; video.load(); setMediaStatus(`正在读取视频：${nextSource.fileName}`);
+  }
+  if (latestPlayback) applyVideoPlayback(latestPlayback);
+}
+async function attemptVideoPlay() {
+  if (videoPlayAttempt) return videoPlayAttempt.promise;
+  enforceMemberVideoMute();
+  const attempt = { promise: null };
+  videoPlayAttempt = attempt;
+  attempt.promise = (async () => {
+    try { await video.play(); return true; }
+    catch {
+      if (videoPlayAttempt === attempt) setMediaStatus(isHost ? '视频未能播放，请再次点击播放。' : '等待浏览器允许播放，请轻触页面重试（始终静音）。');
+      return false;
+    } finally { if (videoPlayAttempt === attempt) videoPlayAttempt = null; }
+  })();
+  return attempt.promise;
+}
+function applyVideoPlayback(playback) {
+  if (source?.kind !== 'video' || !playback) return;
+  enforceMemberVideoMute();
+  const elapsedMs = playback === latestPlayback ? performance.now() - videoReceivedAt : 0;
+  const targetMs = Math.min(source.durationMs ?? Infinity, targetVideoPositionMs(playback, elapsedMs));
+  const decision = decideVideoSync({ isHost, isPlaying: playback.isPlaying, targetMs, currentMs: video.currentTime * 1000, paused: video.paused, readyState: video.readyState, playbackRate: video.playbackRate });
+  if (decision.shouldPause) video.pause();
+  if (decision.seekToMs !== null && video.readyState >= 1) {
+    try { video.currentTime = decision.seekToMs / 1000; } catch { /* 元数据尚未就绪时，canplay 会重新应用最新状态。 */ }
+  }
+  video.playbackRate = isHost ? 1 : Math.min(VIDEO_SYNC.MAX_PLAYBACK_RATE, Math.max(VIDEO_SYNC.MIN_PLAYBACK_RATE, decision.playbackRate));
+  if (decision.shouldPlay && !(isHost && explicitlyPaused)) void attemptVideoPlay();
+}
+async function requestHostVideoPlayback() {
+  if (videoPlayAttempt) return;
+  const sourceId = source.id; const version = ++videoControlVersion;
+  explicitlyPaused = false; $('#toggle-play').disabled = true;
+  // 在点击处理器内直接调用 play，保留浏览器的用户手势授权。
+  const played = await attemptVideoPlay();
+  if (source?.id !== sourceId || version !== videoControlVersion) return;
+  $('#toggle-play').disabled = false;
+  if (!played) return;
+  pendingPlaybackTarget = true;
+  if (!message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true })) { video.pause(); pendingPlaybackTarget = null; }
+}
+async function uploadSelectedVideo(file) {
+  if (!isHost || !roomId || videoUploading) return;
+  if (!file) return showError('请选择 MP4 或 WebM 视频。');
+  const extension = file.name.split('.').pop()?.toLowerCase();
+  const mimeType = extension === 'mp4' ? 'video/mp4' : extension === 'webm' ? 'video/webm' : null;
+  if (!mimeType || (file.type && file.type !== mimeType)) return showError('仅支持 MP4 或 WebM 视频，请检查文件类型。');
+  if (file.size > 2 * 1024 * 1024 * 1024) return showError('视频不能超过 2 GiB。');
+  if (!file.size) return showError('视频文件不能为空。');
+  videoUploading = true; $('#load-video').disabled = true; notice.textContent = '';
+  setMediaStatus('正在上传视频…大文件需要一些时间，上传进度暂不可确定。');
+  try {
+    const response = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/video`, { method: 'POST', headers: { Authorization: `Bearer ${hostToken}`, 'X-File-Name': encodeURIComponent(file.name), 'Content-Type': mimeType }, body: file });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.message || result.error || '视频上传失败，请重试。');
+    // source:loaded 是所有设备统一切换来源的唯一入口。
+    if (source?.id !== result.source?.id) setMediaStatus('视频上传完成，正在等待房间同步…');
+  } catch (error) { showError(error.message || '视频上传失败，请重试。'); setMediaStatus('视频上传失败，可重新选择文件后重试。'); }
+  finally { videoUploading = false; $('#load-video').disabled = false; }
+}
+video.addEventListener('volumechange', enforceMemberVideoMute);
+video.addEventListener('loadedmetadata', () => {
+  if (source?.kind !== 'video') return;
+  enforceMemberVideoMute();
+  const durationMs = Math.round(video.duration * 1000);
+  if (isHost && Number.isFinite(durationMs) && durationMs > 0 && durationMs <= 86_400_000 && videoDurationSent !== durationMs) {
+    if (message({ type: 'source:set-duration', hostToken, sourceId: source.id, durationMs })) videoDurationSent = durationMs;
+  }
+  setMediaStatus(isHost ? '视频已就绪，主机播放声音。' : '视频已就绪，乐手始终静音。');
+  applyVideoPlayback(latestPlayback);
+});
+video.addEventListener('canplay', () => applyVideoPlayback(latestPlayback));
+video.addEventListener('waiting', () => { if (source?.kind === 'video') setMediaStatus('视频正在缓冲…'); });
+video.addEventListener('playing', () => { if (source?.kind === 'video') { enforceMemberVideoMute(); setMediaStatus(isHost ? '视频播放中 · 主机有声' : '视频播放中 · 乐手静音'); } });
+video.addEventListener('error', () => { if (source?.kind === 'video') setMediaStatus('无法解码视频：浏览器可能不支持此编码，或文件已损坏。请尝试 H.264 MP4 或兼容的 WebM。'); });
+video.addEventListener('ended', () => {
+  if (source?.kind !== 'video') return;
+  applyVideoPlayback({ ...latestPlayback, isPlaying: false, positionMs: video.currentTime * 1000 });
+  if (isHost) { explicitlyPaused = true; video.pause(); message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: false }); }
+});
+for (const gesture of ['pointerdown', 'keydown']) document.addEventListener(gesture, () => { if (!isHost) applyVideoPlayback(latestPlayback); });
 function renderScoreSource(score) { $('#score-empty').classList.toggle('hidden', Boolean(score)); $('#score-details').classList.toggle('hidden', !score); if (!score) return; $('#score-title').textContent = score.title; $('#score-meta').textContent = [score.artist, score.tempo ? `${score.tempo} BPM` : '', `${score.barCount} 小节`, score.tempoMap?.length > 2 ? `${score.tempoMap.length - 2} 次变速` : '固定速度'].filter(Boolean).join(' · '); $('#track-select').innerHTML = score.tracks.map((track) => `<option value="${track.index}">${track.index + 1}. ${track.name}</option>`).join(''); selectedTrack = Math.max(0, Math.min(selectedTrack, score.tracks.length - 1)); $('#track-select').value = String(selectedTrack); loadSelectedTrack(); }
 function resetExpiredRoom() {
+  renderSource(null);
   persistResume(null); memberIdentity = null; roomId = null; hostToken = null; isHost = false;
   lobby.classList.remove('hidden'); roomPanel.classList.add('hidden');
   if (alphaTabApi) { alphaTabApi.destroy(); alphaTabApi = null; }
@@ -155,18 +295,15 @@ function handleSocketMessage({ data }) {
   if (event.type === 'playback:state') { lastPlaybackMessageAt = Date.now(); return renderPlayback(event.playback); }
   if (event.type === 'source:loaded') return renderSource(event.source);
   if (event.type !== 'room:joined') return;
-  const sameRoom = roomId === event.room.id && Boolean(alphaTabApi);
-  const sourceChanged = source?.id !== event.source?.id;
   notice.textContent = ''; lobby.classList.add('hidden'); roomPanel.classList.remove('hidden'); roomId = event.room.id;
   $('#room-title').textContent = `房间 ${roomId}`; isHost = pageRole === 'host' && event.room.isHost;
   renderJoinAccess(roomId);
   hostToken = event.hostToken ?? hostToken;
   if (isHost) persistResume({ roomId, hostToken });
   else if (memberIdentity) persistResume({ roomId, name: memberIdentity.name, instrument: memberIdentity.instrument });
-  if (!sameRoom) initializeAlphaTab();
   $('#host-transport').classList.toggle('hidden', !isHost); $('#score-host-actions').classList.toggle('hidden', !isHost); $('#sync-debug').classList.toggle('hidden', isHost || !debugMode);
   renderMembers(event.members);
-  if (!sameRoom || sourceChanged) renderSource(event.source);
+  renderSource(event.source);
   renderPlayback(event.playback);
   connection.textContent = '已连接并进入房间';
 }
@@ -191,22 +328,24 @@ function connectSocket() {
   current.addEventListener('error', () => reportRuntimeError('WebSocket', '连接发生错误，正在自动重试'));
 }
 window.addEventListener('online', connectSocket);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) connectSocket(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { connectSocket(); applyVideoPlayback(latestPlayback); if (roomId) message({ type: 'playback:request-state' }); } });
 $('#create-room').addEventListener('click', () => { if (pageRole === 'host') { persistResume(null); message({ type: 'room:create', clientId }); } });
 $('#join-room').addEventListener('click', () => { if (pageRole === 'member') { memberIdentity = { roomId: $('#room-id').value.replace(/\D/g, ''), name: $('#name').value.trim(), instrument: $('#instrument').value }; message({ type: 'room:join', ...memberIdentity, clientId }); } });
 $('#prepare-audio').addEventListener('click', () => prepareHostAudio(false, true));
-$('#toggle-play').addEventListener('click', () => {
+$('#toggle-play').addEventListener('click', async () => {
   if (!isHost || !latestPlayback) return;
   const currentlyPlaying = pendingPlaybackTarget ?? latestPlayback.isPlaying;
-  if (currentlyPlaying) { explicitlyPaused = true; pendingPlaybackTarget = false; alphaTabApi?.pause(); message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: false }); return; }
+  if (currentlyPlaying) { explicitlyPaused = true; pendingPlaybackTarget = false; videoControlVersion += 1; if (source?.kind === 'video') { video.pause(); applyVideoPlayback({ ...latestPlayback, isPlaying: false }); } alphaTabApi?.pause(); message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: false }); return; }
+  if (source?.kind === 'video') return requestHostVideoPlayback();
   if (!audioReady || !alphaTabApi?.isReadyForPlayback) { prepareHostAudio(false); $('#audio-status').classList.remove('hidden'); $('#audio-status').textContent = '伴奏仍在准备，显示“伴奏已就绪”后请再点一次播放。'; return; }
   requestHostPlayback();
 });
-$('#seek').addEventListener('click', () => { if (isHost) message({ type: 'playback:control', hostToken, action: 'seek', positionMs: Number($('#seek-seconds').value) * 1000 }); });
+$('#seek').addEventListener('click', () => { if (!isHost) return; const positionMs = Number($('#seek-seconds').value) * 1000; if (!Number.isFinite(positionMs) || positionMs < 0) return showError('请输入有效的跳转秒数。'); if (source?.kind === 'video' && latestPlayback) applyVideoPlayback({ ...latestPlayback, positionMs }); message({ type: 'playback:control', hostToken, action: 'seek', positionMs }); });
 $('#track-select').addEventListener('change', () => { selectedTrack = Number($('#track-select').value); loadSelectedTrack(); });
-$('#fullscreen-score').addEventListener('click', async () => { const scoreElement = $('#alpha-tab'); if (!scoreElement || scoreElement.classList.contains('hidden')) return showError('请先等待谱面加载完成。'); try { if (document.fullscreenElement) await document.exitFullscreen(); else if ($('#room').requestFullscreen) await $('#room').requestFullscreen(); else document.body.classList.toggle('score-focus'); } catch { document.body.classList.toggle('score-focus'); } });
-function syncFullscreenUi() { const active = Boolean(document.fullscreenElement) || document.body.classList.contains('score-focus'); $('#fullscreen-score').textContent = active ? '退出全屏' : '全屏看谱'; $('#fullscreen-exit').classList.toggle('hidden', !active); }
+$('#fullscreen-score').addEventListener('click', async () => { const target = source?.kind === 'video' ? video : $('#alpha-tab'); if (!source || target.classList.contains('hidden')) return showError('请先等待排练内容加载完成。'); try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else document.body.classList.toggle('score-focus'); } catch { document.body.classList.toggle('score-focus'); } syncFullscreenUi(); });
+function syncFullscreenUi() { const active = Boolean(document.fullscreenElement) || document.body.classList.contains('score-focus'); $('#fullscreen-score').textContent = active ? '退出全屏' : source?.kind === 'video' ? '全屏看视频' : '全屏看谱'; $('#fullscreen-exit').classList.toggle('hidden', !active); }
 $('#fullscreen-exit').addEventListener('click', async () => { if (document.fullscreenElement) await document.exitFullscreen(); document.body.classList.remove('score-focus'); syncFullscreenUi(); });
 document.addEventListener('fullscreenchange', syncFullscreenUi);
 $('#load-score').addEventListener('click', async () => { const file = $('#score-file').files[0]; if (!isHost || !file) return showError('请选择一个 Guitar Pro 文件。'); if (file.size > 20 * 1024 * 1024) return showError('曲谱不能超过 20 MB。'); const bytes = new Uint8Array(await file.arrayBuffer()); let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); message({ type: 'score:upload', hostToken, upload: { name: file.name, data: btoa(binary) } }); });
+$('#load-video').addEventListener('click', () => uploadSelectedVideo($('#video-file').files[0]));
 connectSocket();

@@ -93,6 +93,22 @@ test('健康检查不暴露敏感信息', async () => {
   assert.equal('hostToken' in health, false);
 });
 
+test('主机页面提供曲谱和本地视频排练内容入口', async () => {
+  const response = await fetch(`${origin}/host`);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /<h3>排练内容<\/h3>/);
+  const hostActions = html.match(/<div id="score-host-actions"[\s\S]*?<\/div>/)?.[0] ?? '';
+  assert.match(hostActions, /id="score-file"/);
+  assert.match(hostActions, /id="video-file"[^>]*accept="\.mp4,\.webm"/);
+  assert.match(hostActions, /id="load-video"/);
+  const video = html.match(/<video\b[^>]*id="video-player"[^>]*>/)?.[0] ?? '';
+  assert.match(video, /\bplaysinline\b/);
+  assert.match(video, /preload="metadata"/);
+  assert.doesNotMatch(video, /\bcontrols\b/);
+  assert.match(html, /id="media-status"[^>]*aria-live="polite"/);
+});
+
 test('法律文件可在离线主机页面读取，二维码拒绝危险协议', async () => {
   const legal = await fetch(`${origin}/legal.html`);
   assert.equal(legal.status, 200);
