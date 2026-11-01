@@ -232,6 +232,7 @@ app.use('/alphatab', express.static(alphaTabDistDir, { cacheControl: true, maxAg
 app.get('/legal-files/Band-Room-AGPL-3.0.txt', (_request, response) => response.sendFile(join(rootDir, 'LICENSE')));
 app.get('/legal-files/THIRD_PARTY_NOTICES.md', (_request, response) => response.sendFile(join(rootDir, 'THIRD_PARTY_NOTICES.md')));
 app.use('/legal-files', express.static(join(rootDir, 'legal'), { cacheControl: true, maxAge: '1d' }));
+app.get('/', (_request, response) => response.redirect('/host'));
 app.use(express.static(`${rootDir}/public`, { cacheControl: false }));
 app.get(['/host', '/join'], (_request, response) => response.sendFile(join(rootDir, 'public', 'index.html')));
 function listeningPort() { const address = server.address(); return typeof address === 'object' && address ? address.port : port; }

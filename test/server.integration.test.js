@@ -94,6 +94,12 @@ test('健康检查不暴露敏感信息', async () => {
   assert.equal('hostToken' in health, false);
 });
 
+test('根地址进入主机控制台', async () => {
+  const response = await fetch(`${origin}/`, { redirect: 'manual' });
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get('location'), '/host');
+});
+
 test('主机页面提供曲谱和本地视频排练内容入口', async () => {
   const response = await fetch(`${origin}/host`);
   assert.equal(response.status, 200);
