@@ -3,6 +3,7 @@
 .vscode/
 .worktrees/
 worktrees/
+.agent-continuity/
 
 # Dependencies and caches
 node_modules/
