@@ -226,3 +226,46 @@ test('空房初始化不显示曲谱伴奏准备按钮', () => {
   assert.equal(b.get('#prepare-audio').classList.contains('hidden'), true);
   assert.equal(b.get('#toggle-play').disabled, true);
 });
+
+for (const trigger of ['canplay', '旧暂停状态']) test(`主机 play 待完成时${trigger}不能打断首次播放`, async () => {
+  const b = browser(); b.run(`renderSource(${videoSource}); renderPlayback(${paused});`);
+  let finish; let abort; let pauses = 0;
+  b.video.play = () => { b.video.paused = false; return new Promise((resolve, reject) => { finish = resolve; abort = reject; }); };
+  b.video.pause = () => { pauses += 1; b.video.paused = true; abort(new Error('The play() request was interrupted by a call to pause()')); };
+  const click = b.get('#toggle-play').emit('click');
+  if (trigger === 'canplay') await b.video.emit('canplay');
+  else b.run(`renderPlayback(${paused})`);
+  assert.equal(pauses, 0, '尚未完成的主机用户播放不能被旧暂停快照中断');
+  assert.equal(b.sent.length, 0, 'play 完成之前仍不能广播');
+  finish(); await click;
+  assert.equal(b.sent.at(-1).isPlaying, true); assert.equal(b.video.paused, false);
+  b.run(`renderPlayback(${paused})`);
+  assert.equal(pauses, 0, '服务端确认播放前的旧暂停快照仍不能打断');
+  b.run('renderPlayback({ positionMs: 0, isPlaying: true, revision: 2 }); renderPlayback({ positionMs: 0, isPlaying: false, revision: 3 });');
+  assert.equal(pauses, 1, '确认播放后应恢复应用正常暂停状态');
+});
+
+test('主机 play 待完成时可显式暂停，并阻止旧 play 成功后广播', async () => {
+  const b = browser(); b.run(`renderSource(${videoSource}); renderPlayback(${paused});`);
+  let finish;
+  b.video.play = () => { b.video.paused = false; return new Promise((resolve) => { finish = resolve; }); };
+  const play = b.get('#toggle-play').emit('click');
+  assert.equal(b.get('#toggle-play').disabled, false, '等待播放期间仍允许用户取消');
+  assert.equal(b.get('#toggle-play').textContent, '暂停');
+  await b.get('#toggle-play').emit('click');
+  assert.equal(b.video.paused, true); assert.equal(b.sent.at(-1)?.isPlaying, false);
+  finish(); await play;
+  assert.equal(b.sent.some((event) => event.isPlaying === true), false);
+  assert.equal(b.video.paused, true);
+});
+
+test('房间失效取消待完成的主机播放意图', async () => {
+  const b = browser(); b.run(`renderSource(${videoSource}); renderPlayback(${paused});`);
+  let finish;
+  b.video.play = () => new Promise((resolve) => { finish = resolve; });
+  const click = b.get('#toggle-play').emit('click');
+  b.run('handleSocketMessage({ data: JSON.stringify({ type: "error", code: "ROOM_NOT_FOUND", message: "房间不存在" }) })');
+  finish(); await click;
+  assert.equal(b.sent.length, 0); assert.equal(b.video.paused, true);
+  assert.equal(b.run('roomId'), null);
+});

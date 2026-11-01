@@ -11,6 +11,7 @@ if (requestedRoomId) $('#room-id').value = requestedRoomId.replace(/\D/g, '').sl
 const resumeKey = `band-room:${pageRole}:resume`;
 const video = $('#video-player');
 let videoReceivedAt = 0; let videoPlayAttempt = null; let videoControlVersion = 0; let videoDurationSent = null; let videoUploading = false;
+let hostVideoPlayIntent = null;
 const clientIdKey = `band-room:${pageRole}:client-id`;
 function readSession(key) { try { return sessionStorage.getItem(key); } catch { return null; } }
 function writeSession(key, value) { try { if (value === null) sessionStorage.removeItem(key); else sessionStorage.setItem(key, value); } catch { /* Safari 私密模式可能禁用存储，连接本身仍可使用。 */ } }
@@ -117,6 +118,7 @@ function followFollowerCursor(scoreX) { const scroller = $('#alpha-tab'); const 
 function updateFollower(positionMs, playback) { if (!followerCursor || !followerCursor.node.isConnected) { scheduleFollowerBuild(); return updateSyncDebug({ playback, issue: '正在重新挂载同步游标' }); } const tick = playback.serverTick ?? Math.round(positionMs * followerCursor.tempo * 960 / 60000); let low = 0; let high = followerCursor.beats.length - 1; let match = null; while (low <= high) { const middle = Math.floor((low + high) / 2); if (followerCursor.beats[middle].tick <= tick) { match = followerCursor.beats[middle]; low = middle + 1; } else high = middle - 1; } if (!match) return updateSyncDebug({ playback, tick, issue: followerCursor.beats.length ? '播放位置在第一拍之前' : '没有可查找的 beat' }); const cursor = { x: match.bounds.onNotesX - 1, y: 0, h: followerCursor.scoreSurface.scrollHeight }; followerCursor.node.style.transform = `translate(${cursor.x}px, ${cursor.y}px)`; followerCursor.node.style.height = `${cursor.h}px`; followerCursor.node.hidden = false; followFollowerCursor(cursor.x); updateSyncDebug({ playback, tick, match, cursor }); }
 function renderPlayback(playback) {
   latestPlayback = playback; videoReceivedAt = performance.now();
+  if (hostVideoPlayIntent && !hostVideoPlayIntent.playPending && playback.isPlaying) hostVideoPlayIntent = null;
   if (pendingPlaybackTarget === null || playback.isPlaying === pendingPlaybackTarget) { controlPending = false; pendingPlaybackTarget = null; }
   const displayedPlaying = pendingPlaybackTarget ?? playback.isPlaying;
   if (isHost) { $('#toggle-play').disabled = !source; $('#alpha-tab').classList.toggle('host-paused-cursor', !playback.isPlaying); }
@@ -124,7 +126,7 @@ function renderPlayback(playback) {
   $('#position').textContent = formatPosition(playback.positionMs);
   $('#toggle-play').textContent = displayedPlaying ? '暂停' : '播放';
   $('#seek-seconds').value = (playback.positionMs / 1000).toFixed(1);
-  if (source?.kind === 'video') { $('#toggle-play').disabled = Boolean(videoPlayAttempt && isHost); applyVideoPlayback(playback); return; }
+  if (source?.kind === 'video') { $('#toggle-play').disabled = Boolean(videoPlayAttempt && isHost && !hostVideoPlayIntent); applyVideoPlayback(playback); return; }
   if (source?.kind !== 'score' || !alphaTabApi) { if (!isHost) updateSyncDebug({ playback, issue: '等待曲谱加载' }); return; }
   const playingFlipped = lastKnownPlaying === null || playback.isPlaying !== lastKnownPlaying;
   lastKnownPlaying = playback.isPlaying;
@@ -161,7 +163,7 @@ function renderSource(nextSource) {
   if (unchanged) { if (source?.kind === 'video') renderVideoSource(source); return; }
   if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
   if (!source) document.body.classList.remove('score-focus');
-  videoControlVersion += 1; videoPlayAttempt = null; videoDurationSent = null;
+  cancelHostVideoPlayIntent(); videoPlayAttempt = null; videoDurationSent = null;
   video.pause(); video.removeAttribute('src'); video.load(); video.playbackRate = 1;
   alphaTabApi?.pause(); alphaTabApi?.destroy(); alphaTabApi = null;
   if (scoreClickHandler) $('#alpha-tab').removeEventListener('click', scoreClickHandler);
@@ -206,7 +208,7 @@ async function attemptVideoPlay() {
   attempt.promise = (async () => {
     try { await video.play(); return true; }
     catch {
-      if (videoPlayAttempt === attempt) setMediaStatus(isHost ? '视频未能播放，请再次点击播放。' : '等待浏览器允许播放，请轻触页面重试（始终静音）。');
+      if (videoPlayAttempt === attempt && !explicitlyPaused) setMediaStatus(isHost ? '视频未能播放，请再次点击播放。' : '等待浏览器允许播放，请轻触页面重试（始终静音）。');
       return false;
     } finally { if (videoPlayAttempt === attempt) videoPlayAttempt = null; }
   })();
@@ -215,6 +217,8 @@ async function attemptVideoPlay() {
 function applyVideoPlayback(playback) {
   if (source?.kind !== 'video' || !playback) return;
   enforceMemberVideoMute();
+  // play() 尚未完成或服务端尚未确认时，旧暂停快照不能撤销本次用户手势。
+  if (isHost && hostVideoPlayIntent && !playback.isPlaying) return;
   const elapsedMs = playback === latestPlayback ? performance.now() - videoReceivedAt : 0;
   const targetMs = Math.min(source.durationMs ?? Infinity, targetVideoPositionMs(playback, elapsedMs));
   const decision = decideVideoSync({ isHost, isPlaying: playback.isPlaying, targetMs, currentMs: video.currentTime * 1000, paused: video.paused, readyState: video.readyState, playbackRate: video.playbackRate });
@@ -225,17 +229,19 @@ function applyVideoPlayback(playback) {
   video.playbackRate = isHost ? 1 : Math.min(VIDEO_SYNC.MAX_PLAYBACK_RATE, Math.max(VIDEO_SYNC.MIN_PLAYBACK_RATE, decision.playbackRate));
   if (decision.shouldPlay && !(isHost && explicitlyPaused)) void attemptVideoPlay();
 }
+function cancelHostVideoPlayIntent() { hostVideoPlayIntent = null; videoControlVersion += 1; }
 async function requestHostVideoPlayback() {
   if (videoPlayAttempt) return;
-  const sourceId = source.id; const version = ++videoControlVersion;
-  explicitlyPaused = false; $('#toggle-play').disabled = true;
+  const intent = { sourceId: source.id, roomId, version: ++videoControlVersion, playPending: true };
+  hostVideoPlayIntent = intent; pendingPlaybackTarget = true;
+  explicitlyPaused = false; $('#toggle-play').disabled = false; $('#toggle-play').textContent = '暂停';
   // 在点击处理器内直接调用 play，保留浏览器的用户手势授权。
   const played = await attemptVideoPlay();
-  if (source?.id !== sourceId || version !== videoControlVersion) return;
+  if (hostVideoPlayIntent !== intent || !isHost || roomId !== intent.roomId || source?.id !== intent.sourceId || intent.version !== videoControlVersion) return;
+  intent.playPending = false;
   $('#toggle-play').disabled = false;
-  if (!played) return;
-  pendingPlaybackTarget = true;
-  if (!message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true })) { video.pause(); pendingPlaybackTarget = null; }
+  if (!played) { cancelHostVideoPlayIntent(); pendingPlaybackTarget = null; $('#toggle-play').textContent = latestPlayback?.isPlaying ? '暂停' : '播放'; return; }
+  if (!message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true })) { cancelHostVideoPlayIntent(); video.pause(); pendingPlaybackTarget = null; }
 }
 async function uploadSelectedVideo(file) {
   if (!isHost || !roomId || videoUploading) return;
@@ -273,6 +279,7 @@ video.addEventListener('playing', () => { if (source?.kind === 'video') { enforc
 video.addEventListener('error', () => { if (source?.kind === 'video') setMediaStatus('无法解码视频：浏览器可能不支持此编码，或文件已损坏。请尝试 H.264 MP4 或兼容的 WebM。'); });
 video.addEventListener('ended', () => {
   if (source?.kind !== 'video') return;
+  if (isHost) cancelHostVideoPlayIntent();
   applyVideoPlayback({ ...latestPlayback, isPlaying: false, positionMs: video.currentTime * 1000 });
   if (isHost) { explicitlyPaused = true; video.pause(); message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: false }); }
 });
@@ -334,8 +341,8 @@ $('#join-room').addEventListener('click', () => { if (pageRole === 'member') { m
 $('#prepare-audio').addEventListener('click', () => prepareHostAudio(false, true));
 $('#toggle-play').addEventListener('click', async () => {
   if (!isHost || !latestPlayback) return;
-  const currentlyPlaying = pendingPlaybackTarget ?? latestPlayback.isPlaying;
-  if (currentlyPlaying) { explicitlyPaused = true; pendingPlaybackTarget = false; videoControlVersion += 1; if (source?.kind === 'video') { video.pause(); applyVideoPlayback({ ...latestPlayback, isPlaying: false }); } alphaTabApi?.pause(); message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: false }); return; }
+  const currentlyPlaying = Boolean(hostVideoPlayIntent) || (pendingPlaybackTarget ?? latestPlayback.isPlaying);
+  if (currentlyPlaying) { explicitlyPaused = true; pendingPlaybackTarget = false; cancelHostVideoPlayIntent(); if (source?.kind === 'video') { video.pause(); applyVideoPlayback({ ...latestPlayback, isPlaying: false }); } alphaTabApi?.pause(); message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: false }); return; }
   if (source?.kind === 'video') return requestHostVideoPlayback();
   if (!audioReady || !alphaTabApi?.isReadyForPlayback) { prepareHostAudio(false); $('#audio-status').classList.remove('hidden'); $('#audio-status').textContent = '伴奏仍在准备，显示“伴奏已就绪”后请再点一次播放。'; return; }
   requestHostPlayback();
