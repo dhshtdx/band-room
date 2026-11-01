@@ -14,7 +14,7 @@ test('normalizes supported MP4 and WebM descriptors, including unknown length', 
   assert.deepEqual(validateVideoDescriptor({ fileName: '/tmp/rehearsal.MP4', mimeType: 'video/mp4', contentLength: 12 }), {
     fileName: 'rehearsal.MP4', extension: '.mp4', mimeType: 'video/mp4', contentLength: 12,
   });
-  assert.deepEqual(validateVideoDescriptor({ fileName: 'take.webm', mimeType: 'application/octet-stream' }), {
+  assert.deepEqual(validateVideoDescriptor({ fileName: 'take.webm', mimeType: 'video/webm' }), {
     fileName: 'take.webm', extension: '.webm', mimeType: 'video/webm',
   });
 });
@@ -42,6 +42,7 @@ test('rejects invalid descriptors and signatures with safe media errors', () => 
     { fileName: 'empty.mp4', mimeType: 'video/mp4', contentLength: 0 },
     { fileName: 'large.webm', mimeType: 'video/webm', contentLength: MAX_VIDEO_BYTES + 1 },
     { fileName: 'clip.mp4', mimeType: 'video/webm' },
+    { fileName: 'clip.mp4', mimeType: 'application/octet-stream' },
   ];
   for (const descriptor of invalid) {
     assert.throws(() => validateVideoDescriptor(descriptor), (error) => {
@@ -51,6 +52,7 @@ test('rejects invalid descriptors and signatures with safe media errors', () => 
     });
   }
   assert.equal(hasValidVideoSignature('video/mp4', Buffer.from([0, 0, 0, 24, ...Buffer.from('ftyp')])), true);
+  assert.equal(hasValidVideoSignature('video/mp4', Buffer.from([0, 0, 0, 24, 0xe6, 0xf4, 0xf9, 0xf0])), false);
   assert.equal(hasValidVideoSignature('video/mp4', Buffer.from('not mp4')), false);
   assert.equal(hasValidVideoSignature('video/webm', Buffer.from([0x1a, 0x45, 0xdf, 0xa3])), true);
   assert.equal(hasValidVideoSignature('video/webm', Buffer.from('not webm')), false);

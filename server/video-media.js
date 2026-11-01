@@ -29,7 +29,7 @@ export function validateVideoDescriptor({ fileName, mimeType, contentLength } = 
   const extension = path.extname(normalizedName).toLowerCase();
   const expectedMimeType = MEDIA_TYPES.get(extension);
   if (!expectedMimeType) throw new VideoMediaError('不支持的视频格式');
-  if (mimeType !== expectedMimeType && mimeType !== 'application/octet-stream') {
+  if (mimeType !== expectedMimeType) {
     throw new VideoMediaError('视频格式与文件类型不匹配');
   }
   if (contentLength !== undefined && (!Number.isSafeInteger(contentLength) || contentLength <= 0 || contentLength > MAX_VIDEO_BYTES)) {
@@ -44,9 +44,11 @@ export function validateVideoDescriptor({ fileName, mimeType, contentLength } = 
 }
 
 export function hasValidVideoSignature(mimeType, headerBytes) {
-  if (!Buffer.isBuffer(headerBytes)) return false;
-  if (mimeType === 'video/mp4') return headerBytes.length >= 8 && headerBytes.toString('ascii', 4, 8) === 'ftyp';
-  if (mimeType === 'video/webm') return headerBytes.length >= 4 && headerBytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+  if (!(Buffer.isBuffer(headerBytes) || headerBytes instanceof Uint8Array)) return false;
+  if (mimeType === 'video/mp4') {
+    return headerBytes.length >= 8 && headerBytes[4] === 0x66 && headerBytes[5] === 0x74 && headerBytes[6] === 0x79 && headerBytes[7] === 0x70;
+  }
+  if (mimeType === 'video/webm') return headerBytes.length >= 4 && headerBytes[0] === 0x1a && headerBytes[1] === 0x45 && headerBytes[2] === 0xdf && headerBytes[3] === 0xa3;
   return false;
 }
 

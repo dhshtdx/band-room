@@ -33,3 +33,27 @@
 ## 问题
 
 - 完整检查中的 HTTP 集成测试需要监听本机网络端口，当前沙箱禁止该操作；需在允许监听的环境重跑完整 `npm run check`。
+
+## 审查修复轮次 1
+
+- 删除 `application/octet-stream` 兼容分支，描述符现在只接受与扩展名严格匹配的 `video/mp4` 或 `video/webm`。
+- MP4 `ftyp` 与 WebM EBML 签名都改为逐字节校验；接受 `Buffer` 和 `Uint8Array` 输入。
+- 增加 `e6 f4 f9 f0` 假 MP4 签名反例，并增加通用 MIME 拒绝断言；WebM 正常用例改用 `video/webm`。
+- RED：更新断言后运行 `node --test test/video-media.test.js`，结果 3/4 通过、1 项失败，失败为通用 MIME 未抛出异常。
+- GREEN：修复后运行 `node --test test/video-media.test.js`，输出如下：
+
+```text
+✔ normalizes supported MP4 and WebM descriptors, including unknown length (0.912666ms)
+✔ parses full, open-ended, and suffix byte ranges (0.216667ms)
+✔ rejects malformed, multiple, out-of-bounds, and zero-size ranges (0.430917ms)
+✔ rejects invalid descriptors and signatures with safe media errors (1.394125ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 57.886459
+```
+- 同次执行的 `git diff --check` 通过。
