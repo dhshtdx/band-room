@@ -32,7 +32,7 @@ function lanAddresses() { return Object.values(os.networkInterfaces()).flat().fi
 
 function createRoom() {
   let id; do { id = crypto.randomInt(1_000_000, 10_000_000).toString(); } while (rooms.has(id));
-  const room = { id, hostToken: crypto.randomBytes(24).toString('base64url'), members: new Set(), uploadRevision: 0, source: null, cleanupTimer: null, playback: { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: 0 } };
+  const room = { id, hostToken: crypto.randomBytes(24).toString('base64url'), members: new Set(), sourceRevision: 0, source: null, cleanupTimer: null, playback: { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: 0 } };
   rooms.set(id, room); return room;
 }
 function members(room) { return [...room.members].map((socket) => ({ name: socket.member.name, instrument: socket.member.instrument })); }
@@ -135,6 +135,8 @@ function scheduleSourceCleanup(source) {
   task.then(finished, finished);
   return task;
 }
+function beginSourceUpload(room) { return ++room.sourceRevision; }
+function isCurrentSourceUpload(room, revision) { return !stopping && rooms.get(room.id) === room && room.sourceRevision === revision; }
 function replaceSource(room, nextSource) {
   const previousSource = room.source;
   room.playback = { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: room.playback.revision + 1 };
@@ -174,7 +176,7 @@ async function receiveVideo(request, response) {
   const bearer = /^Bearer (\S+)$/.exec(authorization ?? '');
   if (!bearer) return response.status(401).json({ message: '需要主机控制凭证。' });
   if (bearer[1] !== room.hostToken) return response.status(403).json({ message: '主机控制凭证无效。' });
-  const revision = ++room.uploadRevision;
+  const revision = beginSourceUpload(room);
   const sourceId = crypto.randomUUID();
   const temporaryPath = join(videosDir, `${room.id}-${sourceId}.upload`);
   let storagePath;
@@ -189,16 +191,16 @@ async function receiveVideo(request, response) {
     await mkdir(videosDir, { recursive: true });
     const { size, headerBytes } = await streamVideoUpload({ request, temporaryPath, maxBytes: MAX_VIDEO_BYTES });
     if (!hasValidVideoSignature(descriptor.mimeType, headerBytes)) throw new VideoMediaError('视频文件标识无效。');
-    if (stopping || rooms.get(room.id) !== room || room.uploadRevision !== revision) {
+    if (!isCurrentSourceUpload(room, revision)) {
       await rm(temporaryPath, { force: true });
-      return response.status(409).json({ message: '此上传已被新的播放源替换。' });
+      return response.status(409).json({ code: 'SOURCE_UPLOAD_CONFLICT', message: '此上传已被新的播放源替换。' });
     }
     storagePath = join(videosDir, `${room.id}-${sourceId}${descriptor.extension}`);
     await rename(temporaryPath, storagePath);
     // rename 是异步边界，新请求可能已占用下一代次。
-    if (stopping || rooms.get(room.id) !== room || room.uploadRevision !== revision) {
+    if (!isCurrentSourceUpload(room, revision)) {
       await rm(storagePath, { force: true });
-      return response.status(409).json({ message: '此上传已被新的播放源替换。' });
+      return response.status(409).json({ code: 'SOURCE_UPLOAD_CONFLICT', message: '此上传已被新的播放源替换。' });
     }
     const source = { kind: 'video', id: sourceId, fileName: descriptor.fileName, mimeType: descriptor.mimeType, size, storagePath };
     replaceSource(room, source);
@@ -288,7 +290,20 @@ wss.on('connection', (socket) => socket.on('message', async (raw) => {
   }
   const room = socket.member?.roomId && rooms.get(socket.member.roomId);
   if (event.type === 'playback:request-state') { if (room) socket.send(JSON.stringify({ type: 'playback:state', playback: playbackState(room) })); return; }
-  if (event.type === 'score:upload') { if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; } try { replaceSource(room, await storeAndParseScore(room, event.upload ?? {})); } catch (error) { socket.send(JSON.stringify({ type: 'error', message: error.message })); } return; }
+  if (event.type === 'score:upload') {
+    if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; }
+    const revision = beginSourceUpload(room);
+    try {
+      const source = await storeAndParseScore(room, event.upload ?? {});
+      if (!isCurrentSourceUpload(room, revision)) {
+        await scheduleSourceCleanup(source);
+        socket.send(JSON.stringify({ type: 'error', code: 'SOURCE_UPLOAD_CONFLICT', message: '此上传已被新的播放源替换。' }));
+        return;
+      }
+      replaceSource(room, source);
+    } catch (error) { socket.send(JSON.stringify({ type: 'error', message: error.message })); }
+    return;
+  }
   if (event.type === 'source:set-duration') {
     if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; }
     if (room.source?.kind !== 'video' || event.sourceId !== room.source.id || !Number.isFinite(event.durationMs) || event.durationMs <= 0 || event.durationMs > 86_400_000) {

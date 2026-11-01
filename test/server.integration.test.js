@@ -522,6 +522,52 @@ test('视频上传允许未知长度、断开清理并由最后开始的请求�
   assert.equal((await videoFiles()).some((name) => name.endsWith('.upload')), false);
 });
 
+test('来源交错：较早视频晚完成不得覆盖较晚曲谱', async (t) => {
+  const { host, hostToken, roomId } = await createRoomWithMembers(0);
+  t.after(() => host.close());
+  const earlierVideo = beginChunkedUpload(roomId, hostToken, t);
+  earlierVideo.request.write(mp4Bytes.subarray(0, 8));
+  await waitForUploadFile();
+  host.send({ type: 'score:upload', hostToken, upload: fakeScoreBuffer(64) });
+  const score = (await host.next('source:loaded', (event) => event.source.kind === 'score')).source;
+  earlierVideo.request.end(mp4Bytes.subarray(8));
+  assert.equal((await earlierVideo.response).status, 409);
+  assert.equal((await videoFiles()).some((name) => name.includes(roomId)), false);
+  assert.equal((await fetch(`${origin}/api/rooms/${roomId}/score/${score.id}`)).status, 200);
+  host.send({ type: 'room:resume', roomId, hostToken, clientId: 'score-wins-over-video' });
+  assert.deepEqual((await host.next('room:joined')).source, score);
+});
+
+test('来源交错：较早曲谱晚完成不得覆盖较晚视频', async (t) => {
+  const { host, hostToken, roomId } = await createRoomWithMembers(0);
+  let releaseWrite;
+  let notifyWritten;
+  const writeAllowed = new Promise((resolve) => { releaseWrite = resolve; });
+  const written = new Promise((resolve) => { notifyWritten = resolve; });
+  const originalWriteFile = fs.writeFile;
+  let earlierScorePath;
+  t.mock.method(fs, 'writeFile', async (path, ...args) => {
+    await originalWriteFile(path, ...args);
+    if (typeof path === 'string' && path.startsWith(join(dataDir, 'scores', `${roomId}-`))) {
+      earlierScorePath = path;
+      notifyWritten();
+      await writeAllowed;
+    }
+  });
+  syncBuiltinESMExports();
+  t.after(() => { releaseWrite(); t.mock.restoreAll(); syncBuiltinESMExports(); host.close(); });
+  host.send({ type: 'score:upload', hostToken, upload: fakeScoreBuffer(64) });
+  await written;
+  const { source } = await (await uploadVideo(roomId, hostToken)).json();
+  await host.next('source:loaded', (event) => event.source.id === source.id);
+  releaseWrite();
+  assert.equal((await host.next('error')).code, 'SOURCE_UPLOAD_CONFLICT');
+  await assert.rejects(fs.access(earlierScorePath), { code: 'ENOENT' });
+  assert.equal((await fetch(`${origin}/api/rooms/${roomId}/video/${source.id}`)).status, 200);
+  host.send({ type: 'room:resume', roomId, hostToken, clientId: 'video-wins-over-score' });
+  assert.deepEqual((await host.next('room:joined')).source, source);
+});
+
 test('视频 Range 读取返回精确字节和响应头，陈旧来源失效且已开始读取安全结束', async (t) => {
   const { host, hostToken, roomId } = await createRoomWithMembers(0);
   t.after(() => host.close());
