@@ -12,6 +12,7 @@ import WebSocket from 'ws';
 const dataDir = await mkdtemp(join(tmpdir(), 'band-room-test-'));
 process.env.PORT = '0';
 process.env.BAND_ROOM_DATA_DIR = dataDir;
+process.env.BAND_ROOM_CLEANUP_GRACE_MS = '100';
 const serverModule = await import('../server/index.js');
 const { port } = await serverModule.serverReady;
 const origin = `http://127.0.0.1:${port}`;
@@ -613,6 +614,8 @@ test('视频 Range 读取返回精确字节和响应头，陈旧来源失效且�
   const large = Buffer.concat([mp4Bytes, Buffer.alloc(4 * 1024 * 1024, 0x63)]);
   const second = (await (await uploadVideo(roomId, hostToken, large)).json()).source;
   assert.equal((await fetch(url)).status, 404);
+  for (let attempt = 0; attempt < 100 && (await videoFiles()).some((name) => name.includes(source.id)); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal((await videoFiles()).some((name) => name.includes(source.id)), false);
   const incoming = await new Promise((resolve, reject) => {
     http.get(`${origin}/api/rooms/${roomId}/video/${second.id}`, (response) => { response.pause(); resolve(response); }).on('error', reject);
   });
@@ -664,6 +667,28 @@ test('视频时长仅允许主机登记当前来源，校验时长并裁剪播�
   assert.equal(ended.playback.positionMs, 250);
   host.send({ type: 'room:resume', roomId, hostToken, clientId: 'duration-resume' });
   assert.equal((await host.next('room:joined')).source.durationMs, 250);
+});
+
+test('房间过期删除视频和未完成上传，保留成员时不提前清理', async (t) => {
+  const { host, hostToken, roomId, members: [member] } = await createRoomWithMembers(1);
+  t.after(() => { host.close(); member.close(); });
+  const { source } = await (await uploadVideo(roomId, hostToken)).json();
+  const pending = beginChunkedUpload(roomId, hostToken, t);
+  pending.request.write(mp4Bytes.subarray(0, 8));
+  await waitForUploadFile();
+  host.close();
+  await host.closePromise;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal((await fetch(`${origin}/api/rooms/${roomId}/video/${source.id}`)).status, 200);
+  member.close();
+  await member.closePromise;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!(await videoFiles()).some((name) => name.startsWith(`${roomId}-`))) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual((await videoFiles()).filter((name) => name.startsWith(`${roomId}-`)), []);
+  assert.equal((await fetch(`${origin}/api/rooms/${roomId}/video/${source.id}`)).status, 404);
+  assert.equal((await uploadVideo(roomId, hostToken)).status, 404);
 });
 
 test('停机等待来源替换触发的 EBUSY 重试完成', async (t) => {

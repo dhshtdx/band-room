@@ -26,7 +26,8 @@ const allowedInstruments = ['guitar', 'bass', 'drums', 'keys', 'vocals', 'other'
 const allowedScoreExtensions = new Set(['.gp', '.gp3', '.gp4', '.gp5', '.gpx']);
 const rooms = new Map();
 const pendingSourceCleanups = new Set();
-const roomCleanupGraceMs = 60_000;
+const configuredCleanupGraceMs = Number(process.env.BAND_ROOM_CLEANUP_GRACE_MS ?? 60_000);
+const roomCleanupGraceMs = Number.isSafeInteger(configuredCleanupGraceMs) && configuredCleanupGraceMs >= 0 && configuredCleanupGraceMs <= 2_147_483_647 ? configuredCleanupGraceMs : 60_000;
 const maxRoomMembers = 32;
 function lanAddresses() { return Object.values(os.networkInterfaces()).flat().filter((entry) => entry?.family === 'IPv4' && !entry.internal).map((entry) => entry.address); }
 
@@ -69,11 +70,18 @@ function updatePlayback(room, patch) { const current = playbackState(room); room
 function cancelRoomCleanup(room) { if (room.cleanupTimer) clearTimeout(room.cleanupTimer); room.cleanupTimer = null; }
 function scheduleRoomCleanup(room) {
   if (stopping || room.members.size || room.cleanupTimer) return;
-  room.cleanupTimer = setTimeout(() => {
+  room.cleanupTimer = setTimeout(async () => {
     room.cleanupTimer = null;
     if (room.members.size || rooms.get(room.id) !== room) return;
-    scheduleSourceCleanup(room.source);
     rooms.delete(room.id);
+    const cleanup = scheduleSourceCleanup(room.source);
+    const uploads = [];
+    for (const [request, task] of pendingVideoUploads) {
+      if (request.params.roomId !== room.id) continue;
+      uploads.push(task);
+      request.destroy();
+    }
+    await Promise.allSettled([cleanup, ...uploads]);
   }, roomCleanupGraceMs);
 }
 function leave(socket) {
