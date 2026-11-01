@@ -19,6 +19,7 @@ const scoresDir = join(dataDir, 'scores');
 const allowedInstruments = ['guitar', 'bass', 'drums', 'keys', 'vocals', 'other'];
 const allowedScoreExtensions = new Set(['.gp', '.gp3', '.gp4', '.gp5', '.gpx']);
 const rooms = new Map();
+const pendingSourceCleanups = new Set();
 const roomCleanupGraceMs = 60_000;
 const maxRoomMembers = 32;
 function lanAddresses() { return Object.values(os.networkInterfaces()).flat().filter((entry) => entry?.family === 'IPv4' && !entry.internal).map((entry) => entry.address); }
@@ -65,7 +66,7 @@ function scheduleRoomCleanup(room) {
   room.cleanupTimer = setTimeout(() => {
     room.cleanupTimer = null;
     if (room.members.size || rooms.get(room.id) !== room) return;
-    removeStoredSource(room.source).catch(reportSourceCleanupError);
+    scheduleSourceCleanup(room.source);
     rooms.delete(room.id);
   }, roomCleanupGraceMs);
 }
@@ -121,13 +122,20 @@ async function removeStoredSource(source) {
   }
 }
 function reportSourceCleanupError(error) { console.error('无法清理播放源临时文件：', error); }
+function scheduleSourceCleanup(source) {
+  const task = removeStoredSource(source).catch(reportSourceCleanupError);
+  pendingSourceCleanups.add(task);
+  const finished = () => pendingSourceCleanups.delete(task);
+  task.then(finished, finished);
+  return task;
+}
 function replaceSource(room, nextSource) {
   const previousSource = room.source;
   room.playback = { isPlaying: false, positionMs: 0, updatedAt: Date.now(), revision: room.playback.revision + 1 };
   room.source = nextSource;
   broadcast(room, { type: 'source:loaded', source: publicSource(nextSource) });
   broadcast(room, { type: 'playback:state', playback: playbackState(room) });
-  removeStoredSource(previousSource).catch(reportSourceCleanupError);
+  scheduleSourceCleanup(previousSource);
 }
 async function storeAndParseScore(room, upload) {
   const raw = Buffer.from(upload.data, 'base64'); const fileName = basename(String(upload.name ?? 'score.gp'));
@@ -237,8 +245,9 @@ export async function stopBandRoomServer() {
   await Promise.allSettled([
     new Promise((resolve) => wss.close(resolve)),
     new Promise((resolve) => server.close(resolve)),
-    ...sources.map((source) => removeStoredSource(source).catch(reportSourceCleanupError))
+    ...sources.map(scheduleSourceCleanup)
   ]);
+  while (pendingSourceCleanups.size) await Promise.allSettled([...pendingSourceCleanups]);
   rooms.clear();
 }
 

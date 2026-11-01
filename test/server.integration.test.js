@@ -395,3 +395,54 @@ test('来源清理短暂锁定时重试，清理失败仍上线新来源并报�
     }
   }
 });
+
+test('停机等待来源替换触发的 EBUSY 重试完成', async (t) => {
+  const { host, hostToken } = await createRoomWithMembers(0);
+  host.send({ type: 'score:upload', hostToken, upload: fakeScoreBuffer(64) });
+  const first = (await host.next('source:loaded')).source;
+  const oldFile = (await readdir(join(dataDir, 'scores'))).find((file) => file.includes(first.id));
+  assert.ok(oldFile);
+  const oldPath = join(dataDir, 'scores', oldFile);
+  const originalRm = fs.rm;
+  let attempts = 0;
+  let releaseDeletion;
+  let notifyRetry;
+  const deletionAllowed = new Promise((resolve) => { releaseDeletion = resolve; });
+  const retryStarted = new Promise((resolve) => { notifyRetry = resolve; });
+  t.mock.method(fs, 'rm', async (path, options) => {
+    if (path === oldPath) {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error('临时锁定'), { code: 'EBUSY' });
+      notifyRetry();
+      await deletionAllowed;
+    }
+    return originalRm(path, options);
+  });
+  syncBuiltinESMExports();
+  let stopped;
+  try {
+    host.send({ type: 'score:upload', hostToken, upload: fakeScoreBuffer(64) });
+    await host.next('source:loaded');
+    let stopReturned = false;
+    stopped = serverModule.stopBandRoomServer().then(() => { stopReturned = true; });
+    const firstCompleted = await Promise.race([
+      stopped.then(() => 'stopped'),
+      retryStarted.then(() => 'retrying')
+    ]);
+    assert.equal(firstCompleted, 'retrying');
+    // 第二次删除仍被闸门挂起，停机不能提前返回。
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(stopReturned, false);
+    await fs.access(oldPath);
+    releaseDeletion();
+    await stopped;
+    assert.equal(attempts, 2);
+    await assert.rejects(fs.access(oldPath), { code: 'ENOENT' });
+  } finally {
+    releaseDeletion();
+    await stopped;
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    host.close();
+  }
+});
