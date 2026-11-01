@@ -65,6 +65,42 @@ test('视频主机 play 成功后才广播；失败保留服务器暂停', async
   assert.match(failed.get('#media-status').textContent, /播放|点击/);
 });
 
+test('结尾重播先归零服务端位置，再广播播放，且等待本地 play 成功', async () => {
+  const b = browser();
+  b.run(`renderSource({ ...${videoSource}, durationMs: 12000 }); renderPlayback({ positionMs: 12000, isPlaying: false, revision: 3 });`);
+  let finish;
+  b.video.play = () => { b.video.paused = false; return new Promise((resolve) => { finish = resolve; }); };
+  const click = b.get('#toggle-play').emit('click');
+  assert.equal(b.sent.length, 0);
+  assert.equal(b.video.currentTime, 0, '在本地 play 开始前也应归零');
+  finish(); await click;
+  assert.deepEqual(b.sent, [
+    { type: 'playback:control', hostToken: 'host-secret', action: 'seek', positionMs: 0 },
+    { type: 'playback:control', hostToken: 'host-secret', action: 'set-playing', isPlaying: true },
+  ]);
+  b.run('renderPlayback({ positionMs: 0, isPlaying: false, revision: 4 }); renderPlayback({ positionMs: 0, isPlaying: true, revision: 5 });');
+  assert.equal(b.run('hostVideoPlayIntent'), null);
+  assert.equal(b.video.paused, false);
+  assert.equal(b.video.currentTime, 0);
+});
+
+for (const pending of [true, false]) test(`同来源重连取消${pending ? '尚未完成' : '尚未确认'}的主机播放意图并应用权威暂停`, async () => {
+  const b = browser(); b.run(`renderSource(${videoSource}); renderPlayback(${paused});`);
+  let finish;
+  b.video.play = () => { b.video.paused = false; return new Promise((resolve) => { finish = resolve; }); };
+  const click = b.get('#toggle-play').emit('click');
+  if (!pending) { finish(); await click; }
+  b.sent.length = 0;
+  b.context.joined = { type: 'room:joined', room: { id: '1234567', isHost: true }, source: { kind: 'video', id: 'take-1', durationMs: 12000 }, members: [], playback: { positionMs: 6000, isPlaying: false, revision: 4 } };
+  b.run('handleSocketMessage({ data: JSON.stringify(joined) })');
+  assert.equal(b.run('hostVideoPlayIntent'), null);
+  assert.equal(b.video.paused, true);
+  assert.equal(b.video.currentTime, 6);
+  assert.equal(b.get('#toggle-play').textContent, '播放');
+  finish(); await click;
+  assert.equal(b.sent.length, 0, '重连前的异步结果不能重新广播播放');
+});
+
 test('乐手渲染和音量事件始终强制静音，且不能登记时长', async () => {
   const b = browser('member'); b.run(`renderSource(${videoSource});`);
   assert.equal(b.video.muted, true); assert.equal(b.video.defaultMuted, true); assert.equal(b.video.volume, 0);

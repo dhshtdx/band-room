@@ -35,3 +35,26 @@ test('does not repeatedly request playback while media is not ready', () => {
   const decision = decideVideoSync({ isHost: false, isPlaying: true, targetMs: 1000, currentMs: 1000, paused: true, readyState: 1, playbackRate: 1 });
   assert.equal(decision.shouldPlay, false);
 });
+
+test('paused correction starts above 150ms in both drift directions', () => {
+  for (const direction of [-1, 1]) for (const [drift, seeks] of [[150, false], [151, true]]) {
+    const result = decideVideoSync({ isHost: false, isPlaying: false, targetMs: 2000 + direction * drift, currentMs: 2000, paused: true, readyState: 4, playbackRate: 1 });
+    assert.equal(result.seekToMs, seeks ? 2000 + direction * drift : null, `paused drift ${direction * drift}ms`);
+  }
+});
+
+test('member rate adjustment begins at 250ms and hard seek above 1000ms', () => {
+  for (const direction of [-1, 1]) for (const [drift, seeks, rate] of [[249, false, 1], [250, false, direction < 0 ? 0.975 : 1.025], [251, false, direction < 0 ? 0.9749 : 1.0251], [1000, false, direction < 0 ? 0.97 : 1.03], [1001, true, 1]]) {
+    const result = decideVideoSync({ isHost: false, isPlaying: true, targetMs: 2000 + direction * drift, currentMs: 2000, paused: false, readyState: 4, playbackRate: 1.02 });
+    assert.equal(result.seekToMs, seeks ? 2000 + direction * drift : null, `member drift ${direction * drift}ms`);
+    assert.equal(result.playbackRate, rate, `member drift ${direction * drift}ms`);
+  }
+});
+
+test('host seeks only above 250ms and always restores normal rate', () => {
+  for (const direction of [-1, 1]) for (const [drift, seeks] of [[249, false], [250, false], [251, true], [1000, true], [1001, true]]) {
+    const result = decideVideoSync({ isHost: true, isPlaying: true, targetMs: 2000 + direction * drift, currentMs: 2000, paused: false, readyState: 4, playbackRate: 1.02 });
+    assert.equal(result.seekToMs, seeks ? 2000 + direction * drift : null, `host drift ${direction * drift}ms`);
+    assert.equal(result.playbackRate, 1);
+  }
+});

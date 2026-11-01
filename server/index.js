@@ -22,6 +22,7 @@ const dataDir = process.env.BAND_ROOM_DATA_DIR || join(rootDir, 'work');
 const scoresDir = join(dataDir, 'scores');
 const videosDir = join(dataDir, 'videos');
 const pendingVideoUploads = new Map();
+const pendingScoreUploads = new Set();
 const allowedInstruments = ['guitar', 'bass', 'drums', 'keys', 'vocals', 'other'];
 const allowedScoreExtensions = new Set(['.gp', '.gp3', '.gp4', '.gp5', '.gpx']);
 const rooms = new Map();
@@ -284,6 +285,7 @@ export const serverReady = new Promise((resolve, reject) => {
 const wss = new WebSocketServer({ server, maxPayload: 30 * 1024 * 1024, perMessageDeflate: false });
 const playbackTicker = setInterval(() => { for (const room of rooms.values()) if (room.playback.isPlaying) { const current = playbackState(room); if (!current.isPlaying) updatePlayback(room, { isPlaying: false, positionMs: current.positionMs }); else broadcast(room, { type: 'playback:state', playback: current }); } }, 100);
 wss.on('connection', (socket) => socket.on('message', async (raw) => {
+  if (stopping) return;
   let event; try { event = JSON.parse(raw); } catch { socket.send(JSON.stringify({ type: 'error', message: '消息格式无效。' })); return; }
   if (event.type === 'room:create') { leave(socket); const room = createRoom(); joinSocket(room, socket, { clientId: String(event.clientId ?? ''), name: '主机', instrument: 'host', isHost: true }); socket.send(JSON.stringify(joinedEvent(room, socket, room.hostToken))); return; }
   if (event.type === 'room:resume') {
@@ -301,7 +303,7 @@ wss.on('connection', (socket) => socket.on('message', async (raw) => {
   if (event.type === 'score:upload') {
     if (!room || !socket.member.isHost || event.hostToken !== room.hostToken) { socket.send(JSON.stringify({ type: 'error', code: 'HOST_AUTH_INVALID', message: '主机控制凭证无效。' })); return; }
     const revision = beginSourceUpload(room);
-    try {
+    const task = (async () => { try {
       const source = await storeAndParseScore(room, event.upload ?? {});
       if (!isCurrentSourceUpload(room, revision)) {
         await scheduleSourceCleanup(source);
@@ -309,7 +311,9 @@ wss.on('connection', (socket) => socket.on('message', async (raw) => {
         return;
       }
       replaceSource(room, source);
-    } catch (error) { socket.send(JSON.stringify({ type: 'error', message: error.message })); }
+    } catch (error) { socket.send(JSON.stringify({ type: 'error', message: error.message })); } })();
+    pendingScoreUploads.add(task);
+    try { await task; } finally { pendingScoreUploads.delete(task); }
     return;
   }
   if (event.type === 'source:set-duration') {
@@ -351,7 +355,7 @@ export async function stopBandRoomServer() {
   clearInterval(playbackTicker);
   clearInterval(heartbeat);
   for (const request of pendingVideoUploads.keys()) request.destroy();
-  await Promise.allSettled([...pendingVideoUploads.values()]);
+  await Promise.allSettled([...pendingVideoUploads.values(), ...pendingScoreUploads]);
   const sources = [];
   for (const room of rooms.values()) {
     cancelRoomCleanup(room);

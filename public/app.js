@@ -232,16 +232,20 @@ function applyVideoPlayback(playback) {
 function cancelHostVideoPlayIntent() { hostVideoPlayIntent = null; videoControlVersion += 1; }
 async function requestHostVideoPlayback() {
   if (videoPlayAttempt) return;
+  const durationMs = source.durationMs ?? video.duration * 1000;
+  const replayFromEnd = Number.isFinite(durationMs) && durationMs > 0 && (latestPlayback?.positionMs >= durationMs || video.currentTime * 1000 >= durationMs);
   const intent = { sourceId: source.id, roomId, version: ++videoControlVersion, playPending: true };
   hostVideoPlayIntent = intent; pendingPlaybackTarget = true;
   explicitlyPaused = false; $('#toggle-play').disabled = false; $('#toggle-play').textContent = '暂停';
+  if (replayFromEnd) video.currentTime = 0;
   // 在点击处理器内直接调用 play，保留浏览器的用户手势授权。
   const played = await attemptVideoPlay();
   if (hostVideoPlayIntent !== intent || !isHost || roomId !== intent.roomId || source?.id !== intent.sourceId || intent.version !== videoControlVersion) return;
   intent.playPending = false;
   $('#toggle-play').disabled = false;
   if (!played) { cancelHostVideoPlayIntent(); pendingPlaybackTarget = null; $('#toggle-play').textContent = latestPlayback?.isPlaying ? '暂停' : '播放'; return; }
-  if (!message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true })) { cancelHostVideoPlayIntent(); video.pause(); pendingPlaybackTarget = null; }
+  const resetSent = !replayFromEnd || message({ type: 'playback:control', hostToken, action: 'seek', positionMs: 0 });
+  if (!resetSent || !message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true })) { cancelHostVideoPlayIntent(); video.pause(); pendingPlaybackTarget = null; }
 }
 async function uploadSelectedVideo(file) {
   if (!isHost || !roomId || videoUploading) return;
@@ -302,6 +306,8 @@ function handleSocketMessage({ data }) {
   if (event.type === 'playback:state') { lastPlaybackMessageAt = Date.now(); return renderPlayback(event.playback); }
   if (event.type === 'source:loaded') return renderSource(event.source);
   if (event.type !== 'room:joined') return;
+  cancelHostVideoPlayIntent(); videoPlayAttempt = null;
+  pendingPlaybackTarget = null; controlPending = false; explicitlyPaused = false; latestPlayback = null;
   notice.textContent = ''; lobby.classList.add('hidden'); roomPanel.classList.remove('hidden'); roomId = event.room.id;
   $('#room-title').textContent = `房间 ${roomId}`; isHost = pageRole === 'host' && event.room.isHost;
   renderJoinAccess(roomId);
