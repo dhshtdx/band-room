@@ -67,7 +67,7 @@ jobs:
           Get-Content release/SHA256SUMS-windows.txt
 
       - name: 上传为构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: band-room-windows-${{ github.run_number }}
           path: |
