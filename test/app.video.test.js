@@ -24,19 +24,19 @@ function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentE
   }
   const get = (selector) => { if (!nodes.has(selector)) nodes.set(selector, element()); return nodes.get(selector); };
   const document = Object.assign(element(), { body: element(), documentElement: element(), querySelector: get, createElement() { const node = element(); createdElements.push(node); return node; }, hidden: false });
-  function event(beforeEmit) {
+  function event(beforeEmit, fireOnRegister) {
     const listeners = [];
-    return { listeners, on(listener) { listeners.push(listener); }, emit(value) { beforeEmit?.(); for (const listener of listeners) listener(value); } };
+    return { listeners, on(listener) { listeners.push(listener); if (fireOnRegister?.()) listener(); }, emit(value) { beforeEmit?.(); for (const listener of listeners) listener(value); } };
   }
   class AlphaTabApi {
     constructor(scoreElement, settings) {
       this.scoreElement = scoreElement; this.settings = settings; this.isReadyForPlayback = false; this.calls = [];
       this.player = { handler: null, masterVolume: 1, output: { updatePosition: (ms) => this.calls.push(['position', ms]) } };
       for (const name of ['renderStarted', 'renderFinished', 'error', 'midiEventsPlayed', 'soundFontLoad', 'soundFontLoaded', 'soundFontLoadFailed', 'playerStateChanged']) this[name] = event();
-      this.playerReady = event(() => { this.isReadyForPlayback = true; });
+      this.playerReady = event(() => { this.isReadyForPlayback = true; }, () => this.isReadyForPlayback);
       alphaTabApis.push(this);
     }
-    load(bytes, tracks) { this.loaded = { bytes, tracks }; }
+    load(bytes, tracks) { this.loaded = { bytes, tracks }; this.tracks = tracks.map((index) => ({ index })); }
     play() { this.calls.push(['play']); this.playerState = 1; return true; }
     pause() { this.calls.push(['pause']); this.playerState = 0; }
     destroy() { this.destroyed = true; }
@@ -68,6 +68,7 @@ function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentE
 const videoSource = `{ kind: 'video', id: 'take-1', fileName: '排练.mp4', mimeType: 'video/mp4', durationMs: null }`;
 const paused = `{ positionMs: 0, isPlaying: false, revision: 1 }`;
 const scoreSource = `{ kind: 'score', id: 'score-1', title: '曲谱', durationMs: 12000, tracks: [{ index: 0, name: '吉他' }], barCount: 4, tempo: 120 }`;
+async function readyMemberScore(api) { await new Promise((resolve) => setImmediate(resolve)); api.renderStarted.emit(); api.renderFinished.emit(); api.playerReady.emit(); }
 
 test('乐手曲谱使用外部媒体原生游标且不加载音色', async () => {
   const b = browser('member');
@@ -81,24 +82,27 @@ test('乐手曲谱使用外部媒体原生游标且不加载音色', async () =>
   assert.equal(player.enableAnimatedBeatCursor, true);
   assert.equal(player.enableUserInteraction, false);
   assert.equal(player.scrollElement, b.get('#alpha-tab'));
-  api.renderFinished.emit();
+  api.renderStarted.emit(); api.renderFinished.emit();
   assert.equal(b.createdElements.some((node) => node.id === 'sync-cursor'), false);
 });
 
-test('乐手在 playerReady 后补应用先到达的播放状态', () => {
+test('乐手在 playerReady 后补应用先到达的播放状态', async () => {
   const b = browser('member');
   b.run(`renderSource(${scoreSource}); renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 });`);
   const api = b.alphaTabApis.at(-1);
+  assert.deepEqual(api.calls, []);
+  await new Promise((resolve) => setImmediate(resolve));
+  api.renderStarted.emit(); api.renderFinished.emit();
   assert.deepEqual(api.calls, []);
   api.playerReady.emit();
   assert.equal(api.player.handler.backingTrackDuration, 12000);
   assert.deepEqual(api.calls, [['position', 4200], ['play']]);
 });
 
-test('连续播放快照只切换一次状态并持续更新原生位置', () => {
+test('连续播放快照只切换一次状态并持续更新原生位置', async () => {
   const b = browser('member');
   b.run(`renderSource(${scoreSource});`);
-  const api = b.alphaTabApis.at(-1); api.playerReady.emit();
+  const api = b.alphaTabApis.at(-1); await readyMemberScore(api);
   b.run('renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 }); renderPlayback({ positionMs: 5100, isPlaying: true, revision: 3 });');
   assert.deepEqual(api.calls, [['position', 4200], ['play'], ['position', 5100]]);
 });
@@ -106,7 +110,7 @@ test('连续播放快照只切换一次状态并持续更新原生位置', () =>
 test('暂停跳转、重连与页面恢复应用最新权威位置', async () => {
   const b = browser('member');
   b.run(`renderSource(${scoreSource});`);
-  const api = b.alphaTabApis.at(-1); api.playerReady.emit();
+  const api = b.alphaTabApis.at(-1); await readyMemberScore(api);
   b.run('renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 }); renderPlayback({ positionMs: 7000, isPlaying: false, revision: 3 });');
   assert.deepEqual(api.calls, [['position', 4200], ['play'], ['position', 7000], ['pause']]);
   b.context.joined = { type: 'room:joined', room: { id: '1234567', isHost: false }, source: { kind: 'score', id: 'score-1', title: '曲谱', durationMs: 12000, tracks: [{ index: 0, name: '吉他' }], barCount: 4, tempo: 120 }, members: [], playback: { positionMs: 8300, isPlaying: false, revision: 4 } };
@@ -118,7 +122,7 @@ test('暂停跳转、重连与页面恢复应用最新权威位置', async () =>
   assert.equal(b.sent.at(-1).type, 'playback:request-state');
 });
 
-test('切源后的旧 playerReady 不驱动新来源', () => {
+test('切源后的旧 playerReady 不驱动新来源', async () => {
   const attached = [];
   const b = browser('member', {
     attachSilentExternalMedia(api, durationMs) { attached.push([api, durationMs]); return true; },
@@ -130,31 +134,43 @@ test('切源后的旧 playerReady 不驱动新来源', () => {
   const currentApi = b.alphaTabApis.at(-1);
   oldApi.playerReady.emit();
   assert.deepEqual(attached, []);
-  currentApi.playerReady.emit();
+  await readyMemberScore(currentApi);
   assert.deepEqual(attached, [[currentApi, 12000]]);
 });
 
-test('切轨后的旧 playerReady 不安装 handler 或应用播放状态', () => {
+test('播放器已 ready 后切轨等待新轨渲染再安装并同步', async () => {
   const attached = [];
   const b = browser('member', {
     attachSilentExternalMedia(api, durationMs) { attached.push([api, durationMs]); return true; },
     applyMemberScorePlayback,
   });
   b.run(`renderSource({ ...${scoreSource}, tracks: [{ index: 0, name: '吉他' }, { index: 1, name: '贝斯' }] }); renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 });`);
-  const api = b.alphaTabApis.at(-1); const oldReady = api.playerReady.listeners.at(-1);
+  const api = b.alphaTabApis.at(-1);
+  await new Promise((resolve) => setImmediate(resolve));
+  api.renderStarted.emit(); api.renderFinished.emit(); api.playerReady.emit();
+  assert.deepEqual(attached, [[api, 12000]]);
+  assert.deepEqual(api.calls, [['position', 4200], ['play']]);
+  const oldReady = api.playerReady.listeners.at(-1);
+  attached.length = 0; api.calls.length = 0;
   b.run('selectedTrack = 1; loadSelectedTrack();');
-  api.isReadyForPlayback = true;
+  assert.deepEqual(attached, [], '新轨尚未加载/渲染时不能因 ready 注册即触发而安装');
+  assert.deepEqual(api.calls, [], '新轨尚未加载/渲染时不能把状态应用到旧轨');
   oldReady();
   assert.deepEqual(attached, []);
   assert.deepEqual(api.calls, []);
-  const currentReady = api.playerReady.listeners.at(-1);
-  assert.notEqual(currentReady, oldReady);
-  currentReady();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(attached, []);
+  assert.deepEqual(api.calls, []);
+  api.renderFinished.emit();
+  assert.deepEqual(attached, [], '新轨 renderStarted 前到达的旧 renderFinished 必须无副作用');
+  assert.deepEqual(api.calls, []);
+  api.renderStarted.emit(); api.renderFinished.emit();
   assert.deepEqual(attached, [[api, 12000]]);
   assert.deepEqual(api.calls, [['position', 4200], ['play']]);
+  assert.equal(api.playerReady.listeners.length, 1, '切轨不得永久新增 playerReady 监听');
 });
 
-test('外部媒体能力缺失显示运行错误且不创建蓝线', () => {
+test('外部媒体能力缺失显示运行错误且不创建蓝线', async () => {
   let attachCalls = 0; let applyCalls = 0;
   const b = browser('member', {
     attachSilentExternalMedia(api, durationMs) { attachCalls += 1; return attachSilentExternalMedia(api, durationMs); },
@@ -164,6 +180,8 @@ test('外部媒体能力缺失显示运行错误且不创建蓝线', () => {
   assert.equal(attachCalls, 0); assert.equal(applyCalls, 0);
   b.run(`renderSource(${scoreSource});`);
   const api = b.alphaTabApis.at(-1); api.player.output = {};
+  await new Promise((resolve) => setImmediate(resolve));
+  api.renderStarted.emit(); api.renderFinished.emit();
   api.playerReady.emit();
   assert.equal(attachCalls, 1);
   assert.match(b.get('#runtime-errors-text').textContent, /MemberScoreSync.*updatePosition/);
