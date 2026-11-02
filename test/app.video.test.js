@@ -9,14 +9,14 @@ const appCode = (await readFile(new URL('../public/app.js', import.meta.url), 'u
 
 // 浏览器边界替身：执行真实应用，媒体解码、DOM 与网络由宿主提供。
 function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentExternalMedia }, { playerReadyOnConstruct = false } = {}) {
-  const nodes = new Map(); const sent = []; const requests = []; const alphaTabApis = []; const createdElements = [];
+  const nodes = new Map(); const sent = []; const requests = []; const alphaTabApis = []; const createdElements = []; const animationFrames = [];
   function element() {
     const events = new Map(); const classes = new Set(['hidden']);
     return {
       classList: { add: (...items) => items.forEach((item) => classes.add(item)), remove: (...items) => items.forEach((item) => classes.delete(item)), contains: (item) => classes.has(item), toggle: (item, force = !classes.has(item)) => { if (force) classes.add(item); else classes.delete(item); return force; } },
       addEventListener(type, listener) { const list = events.get(type) ?? []; list.push(listener); events.set(type, list); },
       removeEventListener() {}, async emit(type) { for (const listener of events.get(type) ?? []) await listener({ type }); },
-      dataset: {}, style: {}, value: '', files: [], disabled: false, textContent: '', innerHTML: '',
+      dataset: {}, style: {}, value: '', files: [], disabled: false, textContent: '', innerHTML: '', clientWidth: 360,
       muted: false, defaultMuted: false, volume: 1, currentTime: 0, duration: 12, playbackRate: 1, paused: true, readyState: 4,
       play() { this.paused = false; return Promise.resolve(); }, pause() { this.paused = true; }, load() {},
       removeAttribute(name) { delete this[name]; }, replaceChildren() {}, remove() {}, append() {},
@@ -32,6 +32,7 @@ function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentE
     constructor(scoreElement, settings) {
       this.scoreElement = scoreElement; this.settings = settings; this.isReadyForPlayback = playerReadyOnConstruct; this.calls = [];
       this.player = { handler: null, masterVolume: 1, output: { updatePosition: (ms) => this.calls.push(['position', ms]) } };
+      this.uiFacade = { getScrollContainer: () => scoreElement, scrollToX: (scroll, x, duration) => this.calls.push(['scroll-x', scroll, x, duration]) };
       for (const name of ['renderStarted', 'renderFinished', 'error', 'midiEventsPlayed', 'soundFontLoad', 'soundFontLoaded', 'soundFontLoadFailed', 'playerStateChanged']) this[name] = event();
       this.playerReady = event(() => { this.isReadyForPlayback = true; }, () => this.isReadyForPlayback);
       alphaTabApis.push(this);
@@ -39,6 +40,8 @@ function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentE
     load(bytes, tracks) { this.loaded = { bytes, tracks }; this.tracks = tracks.map((index) => ({ index })); }
     play() { this.calls.push(['play']); this.playerState = 1; return true; }
     pause() { this.calls.push(['pause']); this.playerState = 0; }
+    triggerResize() { this.calls.push(['resize']); }
+    scrollToCursor() { this.calls.push(['scroll-to-cursor']); }
     destroy() { this.destroyed = true; }
   }
   class Socket {
@@ -56,13 +59,14 @@ function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentE
       midi: { MidiEventType: { NoteOn: 1 } }, synth: { PlayerState: { Paused: 0, Playing: 1 } },
     },
     targetVideoPositionMs, decideVideoSync, VIDEO_SYNC, ...sync,
-    setTimeout: () => 1, clearTimeout() {}, performance: { now: () => 1000 },
+    setTimeout: () => 1, clearTimeout() {}, requestAnimationFrame: (callback) => { animationFrames.push(callback); return animationFrames.length; }, performance: { now: () => 1000 },
     fetch: async (...args) => { requests.push(args); return { ok: true, arrayBuffer: async () => new ArrayBuffer(8), json: async () => ({ source: { kind: 'video', id: 'uploaded' } }) }; },
   });
   vm.runInContext(appCode, context);
   const run = (code) => vm.runInContext(code, context);
   run(`isHost = ${role === 'host'}; roomId = '1234567'; hostToken = 'host-secret';`);
-  return { get, run, context, sent, requests, document, video: get('#video-player'), alphaTabApis, createdElements };
+  const flushAnimationFrame = () => { const callbacks = animationFrames.splice(0); for (const callback of callbacks) callback(1000); };
+  return { get, run, context, sent, requests, document, video: get('#video-player'), alphaTabApis, createdElements, animationFrames, flushAnimationFrame };
 }
 
 const videoSource = `{ kind: 'video', id: 'take-1', fileName: '排练.mp4', mimeType: 'video/mp4', durationMs: null }`;
@@ -85,6 +89,61 @@ test('乐手曲谱使用外部媒体原生游标且不加载音色', async () =>
   assert.equal(player.scrollElement, b.get('#alpha-tab'));
   api.renderStarted.emit(); api.renderFinished.emit();
   assert.equal(b.createdElements.some((node) => node.id === 'sync-cursor'), false);
+});
+
+test('乐手自定义横向滚动按实时宽度保留左侧视野且主机不安装', () => {
+  const member = browser('member');
+  member.run(`renderSource(${scoreSource});`);
+  const memberApi = member.alphaTabApis.at(-1); const scroll = member.get('#alpha-tab');
+  assert.equal(memberApi.settings.player.scrollMode, member.context.alphaTab.ScrollMode.Smooth);
+  assert.ok(memberApi.customScrollHandler);
+  memberApi.customScrollHandler.onBeatCursorUpdating(null, null, null, 300, 420, 900);
+  assert.deepEqual(memberApi.calls, [
+    ['scroll-x', scroll, 214, 0],
+    ['scroll-x', scroll, 334, 900],
+  ]);
+  scroll.clientWidth = 800;
+  memberApi.customScrollHandler.forceScrollTo({ onNotesX: 500 });
+  assert.deepEqual(memberApi.calls.at(-1), ['scroll-x', scroll, 340, 0]);
+  assert.equal(typeof memberApi.customScrollHandler[Symbol.dispose], 'function');
+
+  const host = browser('host');
+  host.run(`renderSource(${scoreSource});`);
+  const hostApi = host.alphaTabApis.at(-1);
+  assert.equal(hostApi.settings.player.scrollMode, host.context.alphaTab.ScrollMode.OffScreen);
+  assert.equal(hostApi.customScrollHandler, undefined);
+});
+
+test('成员原生全屏只在 fullscreenchange 后去重刷新当前曲谱', async () => {
+  const b = browser('member');
+  b.run(`renderSource(${scoreSource});`);
+  const api = b.alphaTabApis.at(-1); const scoreElement = b.get('#alpha-tab');
+  api.renderFinished.emit();
+  scoreElement.requestFullscreen = async () => { b.document.fullscreenElement = scoreElement; };
+  await b.get('#fullscreen-score').emit('click');
+  assert.equal(b.animationFrames.length, 0, '原生全屏点击不能与 fullscreenchange 重复调度');
+  await b.document.emit('fullscreenchange');
+  await b.document.emit('fullscreenchange');
+  assert.equal(b.animationFrames.length, 1);
+  b.flushAnimationFrame();
+  assert.deepEqual(api.calls, [['resize'], ['scroll-to-cursor']]);
+});
+
+test('成员回退全屏进入和退出后均刷新当前曲谱', async () => {
+  const b = browser('member');
+  b.run(`renderSource(${scoreSource});`);
+  const api = b.alphaTabApis.at(-1); api.renderFinished.emit();
+  await b.get('#fullscreen-score').emit('click');
+  assert.equal(b.document.body.classList.contains('score-focus'), true);
+  assert.equal(b.animationFrames.length, 1);
+  b.flushAnimationFrame();
+  assert.deepEqual(api.calls, [['resize'], ['scroll-to-cursor']]);
+  api.calls.length = 0;
+  await b.get('#fullscreen-exit').emit('click');
+  assert.equal(b.document.body.classList.contains('score-focus'), false);
+  assert.equal(b.animationFrames.length, 1);
+  b.flushAnimationFrame();
+  assert.deepEqual(api.calls, [['resize'], ['scroll-to-cursor']]);
 });
 
 test('乐手在 playerReady 后补应用先到达的播放状态', async () => {
