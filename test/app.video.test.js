@@ -52,7 +52,7 @@ function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentE
     sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} }, crypto: { randomUUID: () => 'test-client' },
     WebSocket: Socket, URLSearchParams, console, Date,
     alphaTab: {
-      AlphaTabApi, LayoutMode: { Horizontal: 1 }, PlayerMode: { EnabledSynthesizer: 1, EnabledExternalMedia: 2 }, ScrollMode: { OffScreen: 1 },
+      AlphaTabApi, LayoutMode: { Horizontal: 1 }, PlayerMode: { EnabledSynthesizer: 1, EnabledExternalMedia: 2 }, ScrollMode: { OffScreen: 1, Smooth: 2 },
       midi: { MidiEventType: { NoteOn: 1 } }, synth: { PlayerState: { Paused: 0, Playing: 1 } },
     },
     targetVideoPositionMs, decideVideoSync, VIDEO_SYNC, ...sync,
@@ -81,6 +81,7 @@ test('乐手曲谱使用外部媒体原生游标且不加载音色', async () =>
   assert.equal(player.enableElementHighlighting, true);
   assert.equal(player.enableAnimatedBeatCursor, true);
   assert.equal(player.enableUserInteraction, false);
+  assert.equal(player.scrollMode, b.context.alphaTab.ScrollMode.Smooth);
   assert.equal(player.scrollElement, b.get('#alpha-tab'));
   api.renderStarted.emit(); api.renderFinished.emit();
   assert.equal(b.createdElements.some((node) => node.id === 'sync-cursor'), false);
@@ -368,6 +369,7 @@ test('视频切回曲谱后重新加载 AlphaTab、保留主机伴奏和谱面�
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(api.settings.player.enablePlayer, true);
   assert.equal(api.settings.player.playerMode, b.context.alphaTab.PlayerMode.EnabledSynthesizer);
+  assert.equal(api.settings.player.scrollMode, b.context.alphaTab.ScrollMode.OffScreen);
   assert.equal(api.loaded.bytes.byteLength, 8);
   assert.equal(b.get('#video-player').classList.contains('hidden'), true);
   assert.equal(b.get('#prepare-audio').classList.contains('hidden'), false);
