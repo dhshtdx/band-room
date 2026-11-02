@@ -13,7 +13,7 @@ const resumeKey = `band-room:${pageRole}:resume`;
 const video = $('#video-player');
 let videoReceivedAt = 0; let videoPlayAttempt = null; let videoControlVersion = 0; let videoDurationSent = null; let videoUploading = false;
 let hostVideoPlayIntent = null;
-let memberScoreViewportRefresh = null;
+let scoreCursorFollowFrame = null;
 const clientIdKey = `band-room:${pageRole}:client-id`;
 function readSession(key) { try { return sessionStorage.getItem(key); } catch { return null; } }
 function writeSession(key, value) { try { if (value === null) sessionStorage.removeItem(key); else sessionStorage.setItem(key, value); } catch { /* Safari 私密模式可能禁用存储，连接本身仍可使用。 */ } }
@@ -29,20 +29,26 @@ function positionForTick(tick) {
   if (!point) return Math.max(0, Math.round(tick * 60000 / (((source?.tempo || 120) * 960))));
   return Math.max(0, Math.min(source.durationMs ?? Number.POSITIVE_INFINITY, Math.round(point.timeMs + (tick - point.tick) * 60000 / (point.tempo * 960))));
 }
-function createMemberScoreScrollHandler(api, scoreElement) {
-  const scrollToCursorX = (cursorX, duration) => {
-    const inset = Math.min(160, Math.max(56, Math.round(scoreElement.clientWidth * 0.24)));
-    const scroll = api.uiFacade.getScrollContainer();
-    api.uiFacade.scrollToX(scroll, Math.max(0, cursorX - inset), duration);
-  };
-  return {
-    [Symbol.dispose]() {},
-    forceScrollTo(currentBeatBounds) { scrollToCursorX(currentBeatBounds.onNotesX, 0); },
-    onBeatCursorUpdating(_startBeat, _endBeat, _cursorMode, actualStartX, actualEndX, duration) {
-      scrollToCursorX(actualStartX, 0);
-      scrollToCursorX(actualEndX, duration);
-    },
-  };
+function followScoreCursor() {
+  if (source?.kind !== 'score') return false;
+  const scoreElement = $('#alpha-tab'); const cursor = scoreElement.querySelector('.at-cursor-beat');
+  if (!cursor || scoreElement.classList.contains('hidden')) return false;
+  const viewport = scoreElement.getBoundingClientRect(); const cursorBounds = cursor.getBoundingClientRect();
+  if (!(viewport.width > 0) || !(cursorBounds.width > 0)) return false;
+  const inset = Math.min(160, Math.max(56, Math.round(viewport.width * 0.24)));
+  const cursorCenter = (cursorBounds.left + cursorBounds.right) / 2;
+  const maxScroll = Math.max(0, scoreElement.scrollWidth - scoreElement.clientWidth);
+  const target = Math.max(0, Math.min(maxScroll, Math.floor(scoreElement.scrollLeft + cursorCenter - viewport.left - inset)));
+  if (target !== scoreElement.scrollLeft) scoreElement.scrollLeft = target;
+  return true;
+}
+function scheduleScoreCursorFollow() {
+  if (scoreCursorFollowFrame !== null) return;
+  scoreCursorFollowFrame = requestAnimationFrame(() => {
+    scoreCursorFollowFrame = null;
+    followScoreCursor();
+    if (source?.kind === 'score' && latestPlayback?.isPlaying) scheduleScoreCursorFollow();
+  });
 }
 function initializeAlphaTab() {
   const scoreElement = $('#alpha-tab');
@@ -51,11 +57,10 @@ function initializeAlphaTab() {
   const previousApi = alphaTabApi; alphaTabApi = null; previousApi?.destroy();
   memberScorePlaying = null; memberScorePlayerReady = false; memberScoreTrackReady = false; memberScorePlayerAttached = false;
   audioReady = false; audioLoading = false; audioNoteEvents = 0; audioPlayerState = alphaTab.synth.PlayerState.Paused; playAfterAudioReady = false; clearTimeout(audioLoadTimer); clearTimeout(audioStatusTimer); audioStatusTimer = null;
-  alphaTabApi = new alphaTab.AlphaTabApi(scoreElement, { core: { fontDirectory: '/alphatab/font/', scriptFile: `${location.origin}/alphatab/alphaTab.mjs`, useWorkers: true }, display: { layoutMode: alphaTab.LayoutMode.Horizontal, scale: 1 }, player: { enablePlayer: true, playerMode: isHost ? alphaTab.PlayerMode.EnabledSynthesizer : alphaTab.PlayerMode.EnabledExternalMedia, soundFont: isHost ? '/alphatab/soundfont/sonivox.sf2' : null, enableCursor: true, enableElementHighlighting: true, enableAnimatedBeatCursor: true, enableUserInteraction: isHost, scrollMode: isHost ? alphaTab.ScrollMode.OffScreen : alphaTab.ScrollMode.Smooth, nativeBrowserSmoothScroll: true, scrollElement: isHost ? document.documentElement : scoreElement } });
+  alphaTabApi = new alphaTab.AlphaTabApi(scoreElement, { core: { fontDirectory: '/alphatab/font/', scriptFile: `${location.origin}/alphatab/alphaTab.mjs`, useWorkers: true }, display: { layoutMode: alphaTab.LayoutMode.Horizontal, scale: 1 }, player: { enablePlayer: true, playerMode: isHost ? alphaTab.PlayerMode.EnabledSynthesizer : alphaTab.PlayerMode.EnabledExternalMedia, soundFont: isHost ? '/alphatab/soundfont/sonivox.sf2' : null, enableCursor: true, enableElementHighlighting: true, enableAnimatedBeatCursor: true, enableUserInteraction: isHost, scrollMode: alphaTab.ScrollMode.Off, nativeBrowserSmoothScroll: false, scrollElement: scoreElement } });
   const api = alphaTabApi; const sourceId = source?.id;
-  if (pageRole === 'member' && !isHost) api.customScrollHandler = createMemberScoreScrollHandler(api, scoreElement);
   alphaTabApi.renderStarted.on(() => { if (alphaTabApi !== api) return; $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在排版谱面…'; });
-  alphaTabApi.renderFinished.on(() => { if (alphaTabApi !== api) return; clearTimeout(renderTimeout); $('#render-status').classList.add('hidden'); $('#alpha-tab').classList.remove('hidden'); if (isHost) { ensureHostAudioMix(); $('#toggle-play').disabled = false; resumeIfServerPlaying(); return; } if (source?.kind === 'score' && source.id === sourceId) { memberScoreTrackReady = true; initializeMemberScorePlayer(api); } });
+  alphaTabApi.renderFinished.on(() => { if (alphaTabApi !== api) return; clearTimeout(renderTimeout); $('#render-status').classList.add('hidden'); $('#alpha-tab').classList.remove('hidden'); scheduleScoreCursorFollow(); if (isHost) { ensureHostAudioMix(); $('#toggle-play').disabled = false; resumeIfServerPlaying(); return; } if (source?.kind === 'score' && source.id === sourceId) { memberScoreTrackReady = true; initializeMemberScorePlayer(api); } });
   alphaTabApi.error.on((error) => { if (alphaTabApi !== api) return; clearTimeout(renderTimeout); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = `AlphaTab 渲染失败：${error.message ?? '未知错误'}`; reportRuntimeError('AlphaTab', error); });
   if (isHost) {
     scoreClickHandler = (event) => {
@@ -72,7 +77,7 @@ function initializeAlphaTab() {
       const positionMs = positionForTick(tick);
       $('#seek-seconds').value = (positionMs / 1000).toFixed(3);
       // 先驱动当前主机的 AlphaTab player，再让服务器广播同一位置给所有乐手。
-      if (api.isReadyForPlayback) api.timePosition = positionMs;
+      if (api.isReadyForPlayback) { api.timePosition = positionMs; scheduleScoreCursorFollow(); }
       // 服务器仍是唯一时钟：点击只把 AlphaTab 命中的音乐 tick 送给服务器换成位置。
       message({ type: 'playback:control', hostToken, action: 'seek-tick', tick });
     };
@@ -121,7 +126,7 @@ function syncMemberScorePlayback(playback) {
 function ensureHostAudioMix() { if (!isHost || !alphaTabApi) return; alphaTabApi.masterVolume = 1; if (alphaTabApi.score?.tracks?.length) { alphaTabApi.changeTrackSolo([-1], false); alphaTabApi.changeTrackMute([-1], false); alphaTabApi.changeTrackVolume([-1], 1); } }
 function refreshHostAudioStatus(prefix = '') { if (!isHost) return; const state = audioPlayerState === alphaTab.synth.PlayerState.Playing ? '播放中' : '已暂停'; $('#audio-status').classList.remove('hidden'); if (!debugMode) { $('#audio-status').textContent = audioReady ? (state === '播放中' ? '伴奏播放中' : '伴奏已就绪') : audioLoading ? '正在准备伴奏…' : '尚未准备伴奏'; return; } const contextState = alphaTabApi?.player?.output?.context?.state ?? '初始化中'; const details = [`音色${audioReady ? '已加载' : audioLoading ? '加载中' : '未加载'}`, `播放器${state}`, `AudioContext ${contextState}`, `主音量 ${alphaTabApi?.masterVolume ?? 0}`, `MIDI 音符 ${audioNoteEvents}`]; $('#audio-status').textContent = [prefix, ...details].filter(Boolean).join(' · '); }
 function scheduleHostAudioStatus() { if (audioStatusTimer) return; audioStatusTimer = setTimeout(() => { audioStatusTimer = null; refreshHostAudioStatus(); }, 250); }
-function requestHostPlayback() { if (!isHost || !latestPlayback || !alphaTabApi || !audioReady || !alphaTabApi.isReadyForPlayback) return false; explicitlyPaused = false; pendingPlaybackTarget = true; audioNoteEvents = 0; ensureHostAudioMix(); alphaTabApi.player?.output?.activate?.(); alphaTabApi.timePosition = latestPlayback.positionMs; const started = alphaTabApi.play(); if (!started && alphaTabApi.playerState !== alphaTab.synth.PlayerState.Playing) { pendingPlaybackTarget = null; reportRuntimeError('AlphaTab.play', '播放器未能在用户点击时启动'); return false; } refreshHostAudioStatus('已启动伴奏输出'); message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true }); return true; }
+function requestHostPlayback() { if (!isHost || !latestPlayback || !alphaTabApi || !audioReady || !alphaTabApi.isReadyForPlayback) return false; explicitlyPaused = false; pendingPlaybackTarget = true; audioNoteEvents = 0; ensureHostAudioMix(); alphaTabApi.player?.output?.activate?.(); alphaTabApi.timePosition = latestPlayback.positionMs; const started = alphaTabApi.play(); if (!started && alphaTabApi.playerState !== alphaTab.synth.PlayerState.Playing) { pendingPlaybackTarget = null; reportRuntimeError('AlphaTab.play', '播放器未能在用户点击时启动'); return false; } scheduleScoreCursorFollow(); refreshHostAudioStatus('已启动伴奏输出'); message({ type: 'playback:control', hostToken, action: 'set-playing', isPlaying: true }); return true; }
 function startAfterAudioReady() { if (!playAfterAudioReady || !audioReady) return; playAfterAudioReady = false; requestHostPlayback(); }
 function prepareHostAudio(playWhenReady = false, forceReload = false) { if (!isHost || !alphaTabApi) return false; playAfterAudioReady ||= playWhenReady; alphaTabApi.player?.output?.activate?.(); if (audioReady && !forceReload) { ensureHostAudioMix(); refreshHostAudioStatus('伴奏已就绪'); return true; } $('#prepare-audio').disabled = true; $('#prepare-audio').textContent = '正在准备…'; $('#toggle-play').disabled = true; $('#audio-status').classList.remove('hidden'); $('#audio-status').textContent = '正在主动加载主机伴奏音色…'; clearTimeout(audioLoadTimer); if (!audioLoading || forceReload) { audioReady = false; audioLoading = true; const initiated = alphaTabApi.loadSoundFont('/alphatab/soundfont/sonivox.sf2', false); if (!initiated) { audioLoading = false; $('#prepare-audio').disabled = false; $('#prepare-audio').textContent = '重试准备伴奏'; reportRuntimeError('SoundFont', 'AlphaTab 未接受音色加载请求'); return false; } } audioLoadTimer = setTimeout(() => { audioLoading = false; playAfterAudioReady = false; $('#prepare-audio').disabled = false; $('#prepare-audio').textContent = '重试准备伴奏'; $('#toggle-play').disabled = false; $('#audio-status').textContent = '准备伴奏超过 20 秒，请点击“重试准备伴奏”。'; }, 20000); return true; }
 window.addEventListener('error', (event) => reportRuntimeError('window.error', event.error || event.message)); window.addEventListener('unhandledrejection', (event) => reportRuntimeError('unhandledrejection', event.reason));
@@ -153,14 +158,15 @@ function renderPlayback(playback) {
   $('#seek-seconds').value = (playback.positionMs / 1000).toFixed(1);
   if (source?.kind === 'video') { $('#toggle-play').disabled = Boolean(videoPlayAttempt && isHost && !hostVideoPlayIntent); applyVideoPlayback(playback); return; }
   if (source?.kind !== 'score' || !alphaTabApi) { if (!isHost) updateSyncDebug({ playback, issue: '等待曲谱加载' }); return; }
-  if (!isHost) { syncMemberScorePlayback(playback); updateSyncDebug({ playback }); return; }
+  if (!isHost) { syncMemberScorePlayback(playback); scheduleScoreCursorFollow(); updateSyncDebug({ playback }); return; }
   const playingFlipped = lastKnownPlaying === null || playback.isPlaying !== lastKnownPlaying;
   lastKnownPlaying = playback.isPlaying;
   if (playingFlipped && alphaTabApi.isReadyForPlayback) {
     alphaTabApi.timePosition = playback.positionMs;
     if (audioReady && playback.isPlaying) alphaTabApi.play();
     if (!playback.isPlaying) alphaTabApi.pause();
-  }
+  } else if (!playback.isPlaying && alphaTabApi.isReadyForPlayback) alphaTabApi.timePosition = playback.positionMs;
+  scheduleScoreCursorFollow();
 }
 function resumeIfServerPlaying() { if (!isHost || !alphaTabApi || !latestPlayback || explicitlyPaused) return; if (latestPlayback.isPlaying && audioReady && alphaTabApi.isReadyForPlayback) { alphaTabApi.timePosition = latestPlayback.positionMs; alphaTabApi.play(); } }
 let renderTimeout = null;
@@ -383,22 +389,13 @@ $('#toggle-play').addEventListener('click', async () => {
 });
 $('#seek').addEventListener('click', () => { if (!isHost) return; const positionMs = Number($('#seek-seconds').value) * 1000; if (!Number.isFinite(positionMs) || positionMs < 0) return showError('请输入有效的跳转秒数。'); if (source?.kind === 'video' && latestPlayback) applyVideoPlayback({ ...latestPlayback, positionMs }); message({ type: 'playback:control', hostToken, action: 'seek', positionMs }); });
 $('#track-select').addEventListener('change', () => { selectedTrack = Number($('#track-select').value); if (!isHost && source?.kind === 'score') initializeAlphaTab(); loadSelectedTrack(); });
-$('#fullscreen-score').addEventListener('click', async () => { const target = source?.kind === 'video' ? video : $('#alpha-tab'); if (!source || target.classList.contains('hidden')) return showError('请先等待排练内容加载完成。'); let usedFallback = false; try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else { document.body.classList.toggle('score-focus'); usedFallback = true; } } catch { document.body.classList.toggle('score-focus'); usedFallback = true; } syncFullscreenUi(); if (usedFallback) scheduleMemberScoreViewportRefresh(); });
+$('#fullscreen-score').addEventListener('click', async () => { const target = source?.kind === 'video' ? video : $('#alpha-tab'); if (!source || target.classList.contains('hidden')) return showError('请先等待排练内容加载完成。'); let usedFallback = false; try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else { document.body.classList.toggle('score-focus'); usedFallback = true; } } catch { document.body.classList.toggle('score-focus'); usedFallback = true; } syncFullscreenUi(); if (usedFallback) scheduleScoreCursorFollow(); });
 function syncFullscreenUi() { const active = Boolean(document.fullscreenElement) || document.body.classList.contains('score-focus'); $('#fullscreen-score').textContent = active ? '退出全屏' : source?.kind === 'video' ? '全屏看视频' : '全屏看谱'; $('#fullscreen-exit').classList.toggle('hidden', !active); }
-function scheduleMemberScoreViewportRefresh() {
-  const api = alphaTabApi; const sourceId = source?.id;
-  if (memberScoreViewportRefresh?.api === api) return;
-  const refresh = { api };
-  memberScoreViewportRefresh = refresh;
-  requestAnimationFrame(() => {
-    if (memberScoreViewportRefresh === refresh) memberScoreViewportRefresh = null;
-    if (alphaTabApi !== api || pageRole !== 'member' || isHost || source?.kind !== 'score' || source.id !== sourceId) return;
-    api.triggerResize();
-    api.scrollToCursor();
-  });
-}
-$('#fullscreen-exit').addEventListener('click', async () => { const nativeFullscreen = Boolean(document.fullscreenElement); const fallbackActive = document.body.classList.contains('score-focus'); if (nativeFullscreen) await document.exitFullscreen(); document.body.classList.remove('score-focus'); syncFullscreenUi(); if (!nativeFullscreen && fallbackActive) scheduleMemberScoreViewportRefresh(); });
-document.addEventListener('fullscreenchange', () => { syncFullscreenUi(); scheduleMemberScoreViewportRefresh(); });
+$('#fullscreen-exit').addEventListener('click', async () => { const nativeFullscreen = Boolean(document.fullscreenElement); const fallbackActive = document.body.classList.contains('score-focus'); if (nativeFullscreen) await document.exitFullscreen(); document.body.classList.remove('score-focus'); syncFullscreenUi(); if (!nativeFullscreen && fallbackActive) scheduleScoreCursorFollow(); });
+document.addEventListener('fullscreenchange', () => { syncFullscreenUi(); scheduleScoreCursorFollow(); });
+window.addEventListener('orientationchange', scheduleScoreCursorFollow);
+window.addEventListener('resize', scheduleScoreCursorFollow);
+window.visualViewport?.addEventListener('resize', scheduleScoreCursorFollow);
 $('#load-score').addEventListener('click', async () => { const file = $('#score-file').files[0]; if (!isHost || !file) return showError('请选择一个 Guitar Pro 文件。'); if (file.size > 20 * 1024 * 1024) return showError('曲谱不能超过 20 MB。'); const bytes = new Uint8Array(await file.arrayBuffer()); let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); message({ type: 'score:upload', hostToken, upload: { name: file.name, data: btoa(binary) } }); });
 $('#load-video').addEventListener('click', () => uploadSelectedVideo($('#video-file').files[0]));
 connectSocket();
