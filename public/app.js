@@ -61,7 +61,7 @@ function initializeAlphaTab() {
     };
     scoreElement.addEventListener('click', scoreClickHandler);
   }
-  // 乐手端刻意禁用 AlphaTab player；这些 player event 在该模式下不存在。
+  // 乐手端启用无音频的 external-media player；音频类 player event 仅由主机订阅。
   if (isHost) {
     alphaTabApi.midiEventsPlayedFilter = [alphaTab.midi.MidiEventType.NoteOn];
     alphaTabApi.midiEventsPlayed?.on((event) => { audioNoteEvents += event.events?.filter((midiEvent) => midiEvent.type === alphaTab.midi.MidiEventType.NoteOn).length ?? 0; scheduleHostAudioStatus(); });
