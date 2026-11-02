@@ -14,6 +14,7 @@ const video = $('#video-player');
 let videoReceivedAt = 0; let videoPlayAttempt = null; let videoControlVersion = 0; let videoDurationSent = null; let videoUploading = false;
 let hostVideoPlayIntent = null;
 let scoreCursorFollowFrame = null;
+let scoreCursorTracking = false; let scoreCursorTouching = false; let scoreCursorResumeTimer = null;
 const clientIdKey = `band-room:${pageRole}:client-id`;
 function readSession(key) { try { return sessionStorage.getItem(key); } catch { return null; } }
 function writeSession(key, value) { try { if (value === null) sessionStorage.removeItem(key); else sessionStorage.setItem(key, value); } catch { /* Safari 私密模式可能禁用存储，连接本身仍可使用。 */ } }
@@ -32,9 +33,12 @@ function positionForTick(tick) {
 function followScoreCursor() {
   if (source?.kind !== 'score') return false;
   const scoreElement = $('#alpha-tab'); const cursor = scoreElement.querySelector('.at-cursor-beat');
-  if (!cursor || scoreElement.classList.contains('hidden')) return false;
+  if (!cursor || scoreElement.classList.contains('hidden') || scoreCursorTouching) return false;
   const viewport = scoreElement.getBoundingClientRect(); const cursorBounds = cursor.getBoundingClientRect();
   if (!(viewport.width > 0) || !(cursorBounds.width > 0)) return false;
+  const edgeInset = Math.min(120, Math.max(32, Math.round(viewport.width * 0.12)));
+  if (!scoreCursorTracking && cursorBounds.right >= viewport.left + edgeInset && cursorBounds.left <= viewport.right - edgeInset) return true;
+  scoreCursorTracking = true;
   const inset = Math.min(160, Math.max(56, Math.round(viewport.width * 0.24)));
   const cursorCenter = (cursorBounds.left + cursorBounds.right) / 2;
   const maxScroll = Math.max(0, scoreElement.scrollWidth - scoreElement.clientWidth);
@@ -52,6 +56,7 @@ function scheduleScoreCursorFollow() {
 }
 function initializeAlphaTab() {
   const scoreElement = $('#alpha-tab');
+  scoreCursorTracking = false;
   if (scoreClickHandler) scoreElement.removeEventListener('click', scoreClickHandler);
   scoreClickHandler = null;
   const previousApi = alphaTabApi; alphaTabApi = null; previousApi?.destroy();
@@ -148,6 +153,7 @@ function formatPosition(ms) { return `${String(Math.floor(ms / 60000)).padStart(
 function updateSyncDebug({ playback, issue = '' }) { if (isHost) return; const alphaPlayerState = alphaTabApi ? (alphaTabApi.isReadyForPlayback ? 'ready' : 'not ready') : 'instance missing'; const values = [['WebSocket', socket?.readyState === WebSocket.OPEN ? 'connected' : 'reconnecting'], ['playing', String(playback.isPlaying)], ['serverTick', String(playback.serverTick ?? 'missing')], ['currentTempo', `${playback.currentTempo ?? '—'} BPM`], ['lastReceivedTick', String(playback.serverTick ?? 'missing')], ['currentMeasure', String(playback.measure ?? '—')], ['currentBeat', String(playback.beat ?? '—')], ['serverTimestamp', String(playback.timestamp ?? playback.serverNow ?? 'missing')], ['AlphaTab timePosition', String(alphaTabApi?.timePosition ?? 'not exposed')], ['AlphaTab player', alphaPlayerState], ['lastSyncMessage', lastPlaybackMessageAt ? new Date(lastPlaybackMessageAt).toLocaleTimeString() : '未收到'], ['status', issue || 'ok']]; const panel = $('#sync-debug-text'); panel.replaceChildren(...values.flatMap(([term, value]) => { const dt = document.createElement('dt'); dt.textContent = term; const dd = document.createElement('dd'); dd.textContent = value; return [dt, dd]; })); }
 function renderPlayback(playback) {
   latestPlayback = playback; videoReceivedAt = performance.now();
+  if (!playback.isPlaying) scoreCursorTracking = false;
   if (hostVideoPlayIntent && !hostVideoPlayIntent.playPending && playback.isPlaying) hostVideoPlayIntent = null;
   if (pendingPlaybackTarget === null || playback.isPlaying === pendingPlaybackTarget) { controlPending = false; pendingPlaybackTarget = null; }
   const displayedPlaying = pendingPlaybackTarget ?? playback.isPlaying;
@@ -396,6 +402,15 @@ document.addEventListener('fullscreenchange', () => { syncFullscreenUi(); schedu
 window.addEventListener('orientationchange', scheduleScoreCursorFollow);
 window.addEventListener('resize', scheduleScoreCursorFollow);
 window.visualViewport?.addEventListener('resize', scheduleScoreCursorFollow);
+function suspendScoreCursorFollow() { clearTimeout(scoreCursorResumeTimer); scoreCursorResumeTimer = null; scoreCursorTouching = true; scoreCursorTracking = false; }
+function resumeScoreCursorFollowLater() { clearTimeout(scoreCursorResumeTimer); scoreCursorResumeTimer = setTimeout(() => { scoreCursorResumeTimer = null; scoreCursorTouching = false; scheduleScoreCursorFollow(); }, 1500); }
+const scoreTouchSurface = $('#alpha-tab');
+scoreTouchSurface.addEventListener('touchstart', suspendScoreCursorFollow, { passive: true });
+scoreTouchSurface.addEventListener('touchend', resumeScoreCursorFollowLater, { passive: true });
+scoreTouchSurface.addEventListener('touchcancel', resumeScoreCursorFollowLater, { passive: true });
+scoreTouchSurface.addEventListener('pointerdown', suspendScoreCursorFollow);
+window.addEventListener('pointerup', resumeScoreCursorFollowLater);
+window.addEventListener('pointercancel', resumeScoreCursorFollowLater);
 $('#load-score').addEventListener('click', async () => { const file = $('#score-file').files[0]; if (!isHost || !file) return showError('请选择一个 Guitar Pro 文件。'); if (file.size > 20 * 1024 * 1024) return showError('曲谱不能超过 20 MB。'); const bytes = new Uint8Array(await file.arrayBuffer()); let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); message({ type: 'score:upload', hostToken, upload: { name: file.name, data: btoa(binary) } }); });
 $('#load-video').addEventListener('click', () => uploadSelectedVideo($('#video-file').files[0]));
 connectSocket();

@@ -94,10 +94,10 @@ test('乐手曲谱使用外部媒体原生游标且不加载音色', async () =>
   assert.equal(b.createdElements.some((node) => node.id === 'sync-cursor'), false);
 });
 
-test('主机和乐手统一由谱面容器跟随原生游标', () => {
+test('主机和乐手统一在游标接近边缘后跟随滚动', () => {
   for (const role of ['host', 'member']) {
     const b = browser(role);
-    const score = b.get('#alpha-tab'); let cursorContentX = 500;
+    const score = b.get('#alpha-tab'); let cursorContentX = 180;
     const cursor = { getBoundingClientRect: () => ({ left: cursorContentX - score.scrollLeft, right: cursorContentX - score.scrollLeft + 3, width: 3 }) };
     score.querySelector = (selector) => selector === '.at-cursor-beat' ? cursor : null;
     b.run(`renderSource(${scoreSource}); renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 });`);
@@ -105,6 +105,9 @@ test('主机和乐手统一由谱面容器跟随原生游标', () => {
     assert.equal(api.settings.player.scrollMode, b.context.alphaTab.ScrollMode.Off);
     assert.equal(api.settings.player.scrollElement, score);
     assert.equal(api.customScrollHandler, undefined);
+    b.flushAnimationFrame();
+    assert.equal(score.scrollLeft, 0, '游标仍在安全区时不应拖动谱面');
+    cursorContentX = 500;
     b.flushAnimationFrame();
     assert.equal(score.scrollLeft, 415);
     cursorContentX = 900;
@@ -115,6 +118,18 @@ test('主机和乐手统一由谱面容器跟随原生游标', () => {
     b.flushAnimationFrame();
     assert.equal(b.animationFrames.length, 0, '暂停后应停止连续布局读取');
   }
+});
+
+test('手机触摸横向滑动时暂停自动跟随', async () => {
+  const b = browser('member'); const score = b.get('#alpha-tab'); let cursorContentX = 500;
+  score.querySelector = (selector) => selector === '.at-cursor-beat' ? { getBoundingClientRect: () => ({ left: cursorContentX - score.scrollLeft, right: cursorContentX - score.scrollLeft + 3, width: 3 }) } : null;
+  b.run(`renderSource(${scoreSource}); renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 });`);
+  b.flushAnimationFrame();
+  assert.equal(score.scrollLeft, 415);
+  await score.emit('touchstart');
+  score.scrollLeft = 200; cursorContentX = 900;
+  b.flushAnimationFrame();
+  assert.equal(score.scrollLeft, 200, '用户滑动期间不能被下一帧拉回');
 });
 
 test('主机暂停后重播立即恢复谱面跟随', async () => {
