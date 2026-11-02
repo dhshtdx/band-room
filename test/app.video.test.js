@@ -8,7 +8,7 @@ import { decideVideoSync, targetVideoPositionMs, VIDEO_SYNC } from '../public/vi
 const appCode = (await readFile(new URL('../public/app.js', import.meta.url), 'utf8')).replace(/^import .*;\n/gm, '');
 
 // 浏览器边界替身：执行真实应用，媒体解码、DOM 与网络由宿主提供。
-function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentExternalMedia }) {
+function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentExternalMedia }, { playerReadyOnConstruct = false } = {}) {
   const nodes = new Map(); const sent = []; const requests = []; const alphaTabApis = []; const createdElements = [];
   function element() {
     const events = new Map(); const classes = new Set(['hidden']);
@@ -30,7 +30,7 @@ function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentE
   }
   class AlphaTabApi {
     constructor(scoreElement, settings) {
-      this.scoreElement = scoreElement; this.settings = settings; this.isReadyForPlayback = false; this.calls = [];
+      this.scoreElement = scoreElement; this.settings = settings; this.isReadyForPlayback = playerReadyOnConstruct; this.calls = [];
       this.player = { handler: null, masterVolume: 1, output: { updatePosition: (ms) => this.calls.push(['position', ms]) } };
       for (const name of ['renderStarted', 'renderFinished', 'error', 'midiEventsPlayed', 'soundFontLoad', 'soundFontLoaded', 'soundFontLoadFailed', 'playerStateChanged']) this[name] = event();
       this.playerReady = event(() => { this.isReadyForPlayback = true; }, () => this.isReadyForPlayback);
@@ -138,36 +138,35 @@ test('切源后的旧 playerReady 不驱动新来源', async () => {
   assert.deepEqual(attached, [[currentApi, 12000]]);
 });
 
-test('播放器已 ready 后切轨等待新轨渲染再安装并同步', async () => {
+test('切轨后旧 API 的 ready 与延迟渲染不能驱动新轨', async () => {
   const attached = [];
   const b = browser('member', {
     attachSilentExternalMedia(api, durationMs) { attached.push([api, durationMs]); return true; },
     applyMemberScorePlayback,
-  });
+  }, { playerReadyOnConstruct: true });
   b.run(`renderSource({ ...${scoreSource}, tracks: [{ index: 0, name: '吉他' }, { index: 1, name: '贝斯' }] }); renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 });`);
-  const api = b.alphaTabApis.at(-1);
+  const oldApi = b.alphaTabApis.at(-1);
   await new Promise((resolve) => setImmediate(resolve));
-  api.renderStarted.emit(); api.renderFinished.emit(); api.playerReady.emit();
-  assert.deepEqual(attached, [[api, 12000]]);
-  assert.deepEqual(api.calls, [['position', 4200], ['play']]);
-  const oldReady = api.playerReady.listeners.at(-1);
-  attached.length = 0; api.calls.length = 0;
-  b.run('selectedTrack = 1; loadSelectedTrack();');
-  assert.deepEqual(attached, [], '新轨尚未加载/渲染时不能因 ready 注册即触发而安装');
-  assert.deepEqual(api.calls, [], '新轨尚未加载/渲染时不能把状态应用到旧轨');
-  oldReady();
-  assert.deepEqual(attached, []);
-  assert.deepEqual(api.calls, []);
+  b.get('#track-select').value = '1';
+  await b.get('#track-select').emit('change');
   await new Promise((resolve) => setImmediate(resolve));
+  const currentApi = b.alphaTabApis.at(-1);
+  assert.notEqual(currentApi, oldApi, '乐手切轨必须用独立 API 隔离旧 worker 事件');
+  assert.equal(oldApi.destroyed, true);
+
+  oldApi.playerReady.emit();
+  oldApi.renderStarted.emit();
+  oldApi.renderFinished.emit();
   assert.deepEqual(attached, []);
-  assert.deepEqual(api.calls, []);
-  api.renderFinished.emit();
-  assert.deepEqual(attached, [], '新轨 renderStarted 前到达的旧 renderFinished 必须无副作用');
-  assert.deepEqual(api.calls, []);
-  api.renderStarted.emit(); api.renderFinished.emit();
-  assert.deepEqual(attached, [[api, 12000]]);
-  assert.deepEqual(api.calls, [['position', 4200], ['play']]);
-  assert.equal(api.playerReady.listeners.length, 1, '切轨不得永久新增 playerReady 监听');
+  assert.deepEqual(oldApi.calls, []);
+  assert.deepEqual(currentApi.calls, []);
+
+  currentApi.renderStarted.emit();
+  currentApi.renderFinished.emit();
+  assert.deepEqual(attached, [[currentApi, 12000]]);
+  assert.deepEqual(currentApi.calls, [['position', 4200], ['play']]);
+  assert.equal(currentApi.settings.player.playerMode, b.context.alphaTab.PlayerMode.EnabledExternalMedia);
+  assert.equal(currentApi.settings.player.soundFont, null);
 });
 
 test('外部媒体能力缺失显示运行错误且不创建蓝线', async () => {

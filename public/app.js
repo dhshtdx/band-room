@@ -20,7 +20,7 @@ let clientId = readSession(clientIdKey);
 if (!clientId) { clientId = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`; writeSession(clientIdKey, clientId); }
 let resumeInfo = (() => { try { return JSON.parse(readSession(resumeKey) || 'null'); } catch { return null; } })();
 if (pageRole === 'member' && requestedRoomId && resumeInfo?.roomId !== requestedRoomId) { resumeInfo = null; writeSession(resumeKey, null); }
-let socket = null; let reconnectTimer = null; let reconnectAttempt = 0; let memberIdentity = pageRole === 'member' ? resumeInfo : null; let isHost = false; let roomId = null; let hostToken = null; let source = null; let selectedTrack = 0; let lastKnownPlaying = null; let latestPlayback = null; let controlPending = false; let pendingPlaybackTarget = null; let explicitlyPaused = false; let alphaTabApi = null; let memberScorePlaying = null; let memberScoreLoadVersion = 0; let memberScorePendingRenderLoadVersion = 0; let memberScoreRenderingLoadVersion = 0; let memberScoreAttachedLoadVersion = 0; let memberScorePlayerReady = false; let memberScoreTrackReady = false; let audioReady = false; let audioLoading = false; let audioNoteEvents = 0; let audioPlayerState = alphaTab.synth.PlayerState.Paused; let audioLoadTimer = null; let audioStatusTimer = null; let playAfterAudioReady = false; let lastPlaybackMessageAt = null; let scoreClickHandler = null; const runtimeErrors = [];
+let socket = null; let reconnectTimer = null; let reconnectAttempt = 0; let memberIdentity = pageRole === 'member' ? resumeInfo : null; let isHost = false; let roomId = null; let hostToken = null; let source = null; let selectedTrack = 0; let lastKnownPlaying = null; let latestPlayback = null; let controlPending = false; let pendingPlaybackTarget = null; let explicitlyPaused = false; let alphaTabApi = null; let memberScorePlaying = null; let memberScoreLoadVersion = 0; let memberScorePlayerReady = false; let memberScoreTrackReady = false; let memberScorePlayerAttached = false; let audioReady = false; let audioLoading = false; let audioNoteEvents = 0; let audioPlayerState = alphaTab.synth.PlayerState.Paused; let audioLoadTimer = null; let audioStatusTimer = null; let playAfterAudioReady = false; let lastPlaybackMessageAt = null; let scoreClickHandler = null; const runtimeErrors = [];
 function persistResume(value) { resumeInfo = value; writeSession(resumeKey, value ? JSON.stringify(value) : null); }
 function positionForTick(tick) {
   const points = source?.tempoMap ?? []; let point = points[0] ?? null;
@@ -32,14 +32,14 @@ function initializeAlphaTab() {
   const scoreElement = $('#alpha-tab');
   if (scoreClickHandler) scoreElement.removeEventListener('click', scoreClickHandler);
   scoreClickHandler = null;
-  if (alphaTabApi) alphaTabApi.destroy();
-  memberScorePlaying = null; memberScorePlayerReady = false; memberScoreTrackReady = false; memberScorePendingRenderLoadVersion = 0; memberScoreRenderingLoadVersion = 0; memberScoreAttachedLoadVersion = 0;
+  const previousApi = alphaTabApi; alphaTabApi = null; previousApi?.destroy();
+  memberScorePlaying = null; memberScorePlayerReady = false; memberScoreTrackReady = false; memberScorePlayerAttached = false;
   audioReady = false; audioLoading = false; audioNoteEvents = 0; audioPlayerState = alphaTab.synth.PlayerState.Paused; playAfterAudioReady = false; clearTimeout(audioLoadTimer); clearTimeout(audioStatusTimer); audioStatusTimer = null;
   alphaTabApi = new alphaTab.AlphaTabApi(scoreElement, { core: { fontDirectory: '/alphatab/font/', scriptFile: `${location.origin}/alphatab/alphaTab.mjs`, useWorkers: true }, display: { layoutMode: alphaTab.LayoutMode.Horizontal, scale: 1 }, player: { enablePlayer: true, playerMode: isHost ? alphaTab.PlayerMode.EnabledSynthesizer : alphaTab.PlayerMode.EnabledExternalMedia, soundFont: isHost ? '/alphatab/soundfont/sonivox.sf2' : null, enableCursor: true, enableElementHighlighting: true, enableAnimatedBeatCursor: true, enableUserInteraction: isHost, scrollMode: alphaTab.ScrollMode.OffScreen, nativeBrowserSmoothScroll: true, scrollElement: isHost ? document.documentElement : scoreElement } });
   const api = alphaTabApi; const sourceId = source?.id;
-  alphaTabApi.renderStarted.on(() => { $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在排版谱面…'; if (!isHost && alphaTabApi === api && source?.kind === 'score' && source.id === sourceId && memberScorePendingRenderLoadVersion === memberScoreLoadVersion && api.tracks?.some((track) => track.index === selectedTrack)) { memberScoreRenderingLoadVersion = memberScorePendingRenderLoadVersion; memberScorePendingRenderLoadVersion = 0; } });
-  alphaTabApi.renderFinished.on(() => { clearTimeout(renderTimeout); $('#render-status').classList.add('hidden'); $('#alpha-tab').classList.remove('hidden'); if (isHost) { ensureHostAudioMix(); $('#toggle-play').disabled = false; resumeIfServerPlaying(); return; } if (alphaTabApi === api && source?.kind === 'score' && source.id === sourceId && memberScoreRenderingLoadVersion === memberScoreLoadVersion) { memberScoreTrackReady = true; initializeMemberScorePlayer(api); } });
-  alphaTabApi.error.on((error) => { clearTimeout(renderTimeout); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = `AlphaTab 渲染失败：${error.message ?? '未知错误'}`; reportRuntimeError('AlphaTab', error); });
+  alphaTabApi.renderStarted.on(() => { if (alphaTabApi !== api) return; $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在排版谱面…'; });
+  alphaTabApi.renderFinished.on(() => { if (alphaTabApi !== api) return; clearTimeout(renderTimeout); $('#render-status').classList.add('hidden'); $('#alpha-tab').classList.remove('hidden'); if (isHost) { ensureHostAudioMix(); $('#toggle-play').disabled = false; resumeIfServerPlaying(); return; } if (source?.kind === 'score' && source.id === sourceId) { memberScoreTrackReady = true; initializeMemberScorePlayer(api); } });
+  alphaTabApi.error.on((error) => { if (alphaTabApi !== api) return; clearTimeout(renderTimeout); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = `AlphaTab 渲染失败：${error.message ?? '未知错误'}`; reportRuntimeError('AlphaTab', error); });
   if (isHost) {
     scoreClickHandler = (event) => {
       const api = alphaTabApi; const model = api?.score; const lookup = api?.boundsLookup;
@@ -80,11 +80,11 @@ function initializeAlphaTab() {
 }
 function reportRuntimeError(source, error) { const detail = error?.message || String(error); runtimeErrors.unshift(`${new Date().toLocaleTimeString()} [${source}] ${detail}`); $('#runtime-errors-text').textContent = runtimeErrors.slice(0, 8).join('\n'); $('#runtime-errors').classList.remove('hidden'); }
 function initializeMemberScorePlayer(api) {
-  if (pageRole !== 'member' || isHost || source?.kind !== 'score' || alphaTabApi !== api || !memberScorePlayerReady || !memberScoreTrackReady || memberScoreAttachedLoadVersion === memberScoreLoadVersion) return false;
+  if (pageRole !== 'member' || isHost || source?.kind !== 'score' || alphaTabApi !== api || !memberScorePlayerReady || !memberScoreTrackReady || memberScorePlayerAttached) return false;
   try {
     const attached = attachSilentExternalMedia(api, source.durationMs);
     if (!attached) throw new Error('Member score sync requires an initialized AlphaTab player');
-    memberScoreAttachedLoadVersion = memberScoreLoadVersion;
+    memberScorePlayerAttached = true;
     syncMemberScorePlayback(latestPlayback);
     return true;
   } catch (error) {
@@ -93,7 +93,7 @@ function initializeMemberScorePlayer(api) {
   }
 }
 function syncMemberScorePlayback(playback) {
-  if (!playback || pageRole !== 'member' || isHost || source?.kind !== 'score' || !alphaTabApi || !memberScoreTrackReady || memberScoreAttachedLoadVersion !== memberScoreLoadVersion) return;
+  if (!playback || pageRole !== 'member' || isHost || source?.kind !== 'score' || !alphaTabApi || !memberScoreTrackReady || !memberScorePlayerAttached) return;
   try {
     const result = applyMemberScorePlayback(alphaTabApi, playback, memberScorePlaying);
     if (result.applied) memberScorePlaying = result.isPlaying;
@@ -149,7 +149,7 @@ function resumeIfServerPlaying() { if (!isHost || !alphaTabApi || !latestPlaybac
 let renderTimeout = null;
 async function loadSelectedTrack() {
   const loadVersion = ++memberScoreLoadVersion;
-  memberScorePlaying = null; memberScoreTrackReady = false; memberScorePendingRenderLoadVersion = 0;
+  memberScorePlaying = null; memberScoreTrackReady = false; memberScorePlayerAttached = false;
   if (source?.kind !== 'score' || !roomId || !alphaTabApi) return;
   const sourceId = source.id; const api = alphaTabApi; const track = selectedTrack;
   const isCurrent = () => source?.id === sourceId && alphaTabApi === api && selectedTrack === track && memberScoreLoadVersion === loadVersion;
@@ -160,7 +160,7 @@ async function loadSelectedTrack() {
     const response = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/score/${encodeURIComponent(sourceId)}`, { cache: 'no-store' });
     if (!response.ok) throw new Error('无法获取房间曲谱。');
     const bytes = await response.arrayBuffer();
-    if (isCurrent()) { memberScorePendingRenderLoadVersion = loadVersion; api.load(bytes, [track]); }
+    if (isCurrent()) api.load(bytes, [track]);
   } catch (error) {
     if (!isCurrent()) return;
     clearTimeout(renderTimeout); $('#render-status').textContent = `谱面加载失败：${error.message}`;
@@ -365,7 +365,7 @@ $('#toggle-play').addEventListener('click', async () => {
   requestHostPlayback();
 });
 $('#seek').addEventListener('click', () => { if (!isHost) return; const positionMs = Number($('#seek-seconds').value) * 1000; if (!Number.isFinite(positionMs) || positionMs < 0) return showError('请输入有效的跳转秒数。'); if (source?.kind === 'video' && latestPlayback) applyVideoPlayback({ ...latestPlayback, positionMs }); message({ type: 'playback:control', hostToken, action: 'seek', positionMs }); });
-$('#track-select').addEventListener('change', () => { selectedTrack = Number($('#track-select').value); loadSelectedTrack(); });
+$('#track-select').addEventListener('change', () => { selectedTrack = Number($('#track-select').value); if (!isHost && source?.kind === 'score') initializeAlphaTab(); loadSelectedTrack(); });
 $('#fullscreen-score').addEventListener('click', async () => { const target = source?.kind === 'video' ? video : $('#alpha-tab'); if (!source || target.classList.contains('hidden')) return showError('请先等待排练内容加载完成。'); try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else document.body.classList.toggle('score-focus'); } catch { document.body.classList.toggle('score-focus'); } syncFullscreenUi(); });
 function syncFullscreenUi() { const active = Boolean(document.fullscreenElement) || document.body.classList.contains('score-focus'); $('#fullscreen-score').textContent = active ? '退出全屏' : source?.kind === 'video' ? '全屏看视频' : '全屏看谱'; $('#fullscreen-exit').classList.toggle('hidden', !active); }
 $('#fullscreen-exit').addEventListener('click', async () => { if (document.fullscreenElement) await document.exitFullscreen(); document.body.classList.remove('score-focus'); syncFullscreenUi(); });
