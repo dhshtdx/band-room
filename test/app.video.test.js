@@ -26,7 +26,7 @@ function browser(role = 'host', sync = { applyMemberScorePlayback, attachSilentE
   const document = Object.assign(element(), { body: element(), documentElement: element(), querySelector: get, createElement() { const node = element(); createdElements.push(node); return node; }, hidden: false });
   function event(beforeEmit) {
     const listeners = [];
-    return { on(listener) { listeners.push(listener); }, emit(value) { beforeEmit?.(); for (const listener of listeners) listener(value); } };
+    return { listeners, on(listener) { listeners.push(listener); }, emit(value) { beforeEmit?.(); for (const listener of listeners) listener(value); } };
   }
   class AlphaTabApi {
     constructor(scoreElement, settings) {
@@ -118,7 +118,7 @@ test('暂停跳转、重连与页面恢复应用最新权威位置', async () =>
   assert.equal(b.sent.at(-1).type, 'playback:request-state');
 });
 
-test('切轨或切源后的旧 playerReady 不驱动新来源', () => {
+test('切源后的旧 playerReady 不驱动新来源', () => {
   const attached = [];
   const b = browser('member', {
     attachSilentExternalMedia(api, durationMs) { attached.push([api, durationMs]); return true; },
@@ -132,6 +132,26 @@ test('切轨或切源后的旧 playerReady 不驱动新来源', () => {
   assert.deepEqual(attached, []);
   currentApi.playerReady.emit();
   assert.deepEqual(attached, [[currentApi, 12000]]);
+});
+
+test('切轨后的旧 playerReady 不安装 handler 或应用播放状态', () => {
+  const attached = [];
+  const b = browser('member', {
+    attachSilentExternalMedia(api, durationMs) { attached.push([api, durationMs]); return true; },
+    applyMemberScorePlayback,
+  });
+  b.run(`renderSource({ ...${scoreSource}, tracks: [{ index: 0, name: '吉他' }, { index: 1, name: '贝斯' }] }); renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 });`);
+  const api = b.alphaTabApis.at(-1); const oldReady = api.playerReady.listeners.at(-1);
+  b.run('selectedTrack = 1; loadSelectedTrack();');
+  api.isReadyForPlayback = true;
+  oldReady();
+  assert.deepEqual(attached, []);
+  assert.deepEqual(api.calls, []);
+  const currentReady = api.playerReady.listeners.at(-1);
+  assert.notEqual(currentReady, oldReady);
+  currentReady();
+  assert.deepEqual(attached, [[api, 12000]]);
+  assert.deepEqual(api.calls, [['position', 4200], ['play']]);
 });
 
 test('外部媒体能力缺失显示运行错误且不创建蓝线', () => {
