@@ -32,18 +32,18 @@ function positionForTick(tick) {
 }
 function followScoreCursor() {
   if (source?.kind !== 'score') return false;
-  const scoreElement = $('#alpha-tab'); const cursor = scoreElement.querySelector('.at-cursor-beat');
-  if (!cursor || scoreElement.classList.contains('hidden') || scoreCursorTouching) return false;
-  const viewport = scoreElement.getBoundingClientRect(); const cursorBounds = cursor.getBoundingClientRect();
+  const scoreElement = $('#alpha-tab'); const scoreViewport = $('#score-scroll'); const cursor = scoreElement.querySelector('.at-cursor-beat');
+  if (!cursor || scoreViewport.classList.contains('hidden') || scoreCursorTouching) return false;
+  const viewport = scoreViewport.getBoundingClientRect(); const cursorBounds = cursor.getBoundingClientRect();
   if (!(viewport.width > 0) || !(cursorBounds.width > 0)) return false;
   const edgeInset = Math.min(120, Math.max(32, Math.round(viewport.width * 0.12)));
   if (!scoreCursorTracking && cursorBounds.right >= viewport.left + edgeInset && cursorBounds.left <= viewport.right - edgeInset) return true;
   scoreCursorTracking = true;
   const inset = Math.min(160, Math.max(56, Math.round(viewport.width * 0.24)));
   const cursorCenter = (cursorBounds.left + cursorBounds.right) / 2;
-  const maxScroll = Math.max(0, scoreElement.scrollWidth - scoreElement.clientWidth);
-  const target = Math.max(0, Math.min(maxScroll, Math.floor(scoreElement.scrollLeft + cursorCenter - viewport.left - inset)));
-  if (target !== scoreElement.scrollLeft) scoreElement.scrollLeft = target;
+  const maxScroll = Math.max(0, scoreViewport.scrollWidth - scoreViewport.clientWidth);
+  const target = Math.max(0, Math.min(maxScroll, Math.floor(scoreViewport.scrollLeft + cursorCenter - viewport.left - inset)));
+  if (target !== scoreViewport.scrollLeft) scoreViewport.scrollLeft = target;
   return true;
 }
 function scheduleScoreCursorFollow() {
@@ -55,17 +55,18 @@ function scheduleScoreCursorFollow() {
   });
 }
 function initializeAlphaTab() {
-  const scoreElement = $('#alpha-tab');
+  const scoreElement = $('#alpha-tab'); const scoreViewport = $('#score-scroll');
+  scoreElement.style.width = '720px';
   scoreCursorTracking = false;
   if (scoreClickHandler) scoreElement.removeEventListener('click', scoreClickHandler);
   scoreClickHandler = null;
   const previousApi = alphaTabApi; alphaTabApi = null; previousApi?.destroy();
   memberScorePlaying = null; memberScorePlayerReady = false; memberScoreTrackReady = false; memberScorePlayerAttached = false;
   audioReady = false; audioLoading = false; audioNoteEvents = 0; audioPlayerState = alphaTab.synth.PlayerState.Paused; playAfterAudioReady = false; clearTimeout(audioLoadTimer); clearTimeout(audioStatusTimer); audioStatusTimer = null;
-  alphaTabApi = new alphaTab.AlphaTabApi(scoreElement, { core: { fontDirectory: '/alphatab/font/', scriptFile: `${location.origin}/alphatab/alphaTab.mjs`, useWorkers: true }, display: { layoutMode: alphaTab.LayoutMode.Horizontal, scale: 1 }, player: { enablePlayer: true, playerMode: isHost ? alphaTab.PlayerMode.EnabledSynthesizer : alphaTab.PlayerMode.EnabledExternalMedia, soundFont: isHost ? '/alphatab/soundfont/sonivox.sf2' : null, enableCursor: true, enableElementHighlighting: true, enableAnimatedBeatCursor: true, enableUserInteraction: isHost, scrollMode: alphaTab.ScrollMode.Off, nativeBrowserSmoothScroll: false, scrollElement: scoreElement } });
+  alphaTabApi = new alphaTab.AlphaTabApi(scoreElement, { core: { fontDirectory: '/alphatab/font/', scriptFile: `${location.origin}/alphatab/alphaTab.mjs`, useWorkers: true }, display: { layoutMode: alphaTab.LayoutMode.Horizontal, scale: 1 }, player: { enablePlayer: true, playerMode: isHost ? alphaTab.PlayerMode.EnabledSynthesizer : alphaTab.PlayerMode.EnabledExternalMedia, soundFont: isHost ? '/alphatab/soundfont/sonivox.sf2' : null, enableCursor: true, enableElementHighlighting: true, enableAnimatedBeatCursor: true, enableUserInteraction: isHost, scrollMode: alphaTab.ScrollMode.Off, nativeBrowserSmoothScroll: false, scrollElement: scoreViewport } });
   const api = alphaTabApi; const sourceId = source?.id;
   alphaTabApi.renderStarted.on(() => { if (alphaTabApi !== api) return; $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在排版谱面…'; });
-  alphaTabApi.renderFinished.on(() => { if (alphaTabApi !== api) return; clearTimeout(renderTimeout); $('#render-status').classList.add('hidden'); $('#alpha-tab').classList.remove('hidden'); scheduleScoreCursorFollow(); if (isHost) { ensureHostAudioMix(); $('#toggle-play').disabled = false; resumeIfServerPlaying(); return; } if (source?.kind === 'score' && source.id === sourceId) { memberScoreTrackReady = true; initializeMemberScorePlayer(api); } });
+  alphaTabApi.renderFinished.on(() => { if (alphaTabApi !== api) return; clearTimeout(renderTimeout); $('#render-status').classList.add('hidden'); $('#score-scroll').classList.remove('hidden'); scheduleScoreCursorFollow(); if (isHost) { ensureHostAudioMix(); $('#toggle-play').disabled = false; resumeIfServerPlaying(); return; } if (source?.kind === 'score' && source.id === sourceId) { memberScoreTrackReady = true; initializeMemberScorePlayer(api); } });
   alphaTabApi.error.on((error) => { if (alphaTabApi !== api) return; clearTimeout(renderTimeout); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = `AlphaTab 渲染失败：${error.message ?? '未知错误'}`; reportRuntimeError('AlphaTab', error); });
   if (isHost) {
     scoreClickHandler = (event) => {
@@ -183,7 +184,7 @@ async function loadSelectedTrack() {
   const sourceId = source.id; const api = alphaTabApi; const track = selectedTrack;
   const isCurrent = () => source?.id === sourceId && alphaTabApi === api && selectedTrack === track && memberScoreLoadVersion === loadVersion;
   clearTimeout(renderTimeout);
-  $('#alpha-tab').classList.remove('hidden'); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在加载并排版谱面…';
+  $('#score-scroll').classList.remove('hidden'); $('#render-status').classList.remove('hidden'); $('#render-status').textContent = '正在加载并排版谱面…';
   renderTimeout = setTimeout(() => { $('#render-status').textContent = '排版超过 30 秒：请刷新页面后重试，并检查浏览器控制台错误。'; }, 30000);
   try {
     const response = await fetch(`/api/rooms/${encodeURIComponent(roomId)}/score/${encodeURIComponent(sourceId)}`, { cache: 'no-store' });
@@ -211,7 +212,7 @@ function renderSource(nextSource) {
   memberScorePlaying = null; lastKnownPlaying = null; latestPlayback = null; videoReceivedAt = 0;
   audioReady = false; audioLoading = false; explicitlyPaused = false;
   pendingPlaybackTarget = null; controlPending = false; playAfterAudioReady = false;
-  $('#alpha-tab').classList.add('hidden'); $('#render-status').classList.add('hidden'); $('#audio-status').classList.add('hidden');
+  $('#score-scroll').classList.add('hidden'); $('#render-status').classList.add('hidden'); $('#audio-status').classList.add('hidden');
   $('#video-player').classList.toggle('hidden', source?.kind !== 'video');
   $('#media-status').classList.toggle('hidden', source?.kind !== 'video');
   $('#prepare-audio').classList.toggle('hidden', source?.kind !== 'score');
@@ -395,7 +396,7 @@ $('#toggle-play').addEventListener('click', async () => {
 });
 $('#seek').addEventListener('click', () => { if (!isHost) return; const positionMs = Number($('#seek-seconds').value) * 1000; if (!Number.isFinite(positionMs) || positionMs < 0) return showError('请输入有效的跳转秒数。'); if (source?.kind === 'video' && latestPlayback) applyVideoPlayback({ ...latestPlayback, positionMs }); message({ type: 'playback:control', hostToken, action: 'seek', positionMs }); });
 $('#track-select').addEventListener('change', () => { selectedTrack = Number($('#track-select').value); if (!isHost && source?.kind === 'score') initializeAlphaTab(); loadSelectedTrack(); });
-$('#fullscreen-score').addEventListener('click', async () => { const target = source?.kind === 'video' ? video : $('#alpha-tab'); if (!source || target.classList.contains('hidden')) return showError('请先等待排练内容加载完成。'); let usedFallback = false; try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else { document.body.classList.toggle('score-focus'); usedFallback = true; } } catch { document.body.classList.toggle('score-focus'); usedFallback = true; } syncFullscreenUi(); if (usedFallback) scheduleScoreCursorFollow(); });
+$('#fullscreen-score').addEventListener('click', async () => { const target = source?.kind === 'video' ? video : $('#score-scroll'); if (!source || target.classList.contains('hidden')) return showError('请先等待排练内容加载完成。'); let usedFallback = false; try { if (document.fullscreenElement) await document.exitFullscreen(); else if (target.requestFullscreen) await target.requestFullscreen(); else { document.body.classList.toggle('score-focus'); usedFallback = true; } } catch { document.body.classList.toggle('score-focus'); usedFallback = true; } syncFullscreenUi(); if (usedFallback) scheduleScoreCursorFollow(); });
 function syncFullscreenUi() { const active = Boolean(document.fullscreenElement) || document.body.classList.contains('score-focus'); $('#fullscreen-score').textContent = active ? '退出全屏' : source?.kind === 'video' ? '全屏看视频' : '全屏看谱'; $('#fullscreen-exit').classList.toggle('hidden', !active); }
 $('#fullscreen-exit').addEventListener('click', async () => { const nativeFullscreen = Boolean(document.fullscreenElement); const fallbackActive = document.body.classList.contains('score-focus'); if (nativeFullscreen) await document.exitFullscreen(); document.body.classList.remove('score-focus'); syncFullscreenUi(); if (!nativeFullscreen && fallbackActive) scheduleScoreCursorFollow(); });
 document.addEventListener('fullscreenchange', () => { syncFullscreenUi(); scheduleScoreCursorFollow(); });
@@ -404,7 +405,7 @@ window.addEventListener('resize', scheduleScoreCursorFollow);
 window.visualViewport?.addEventListener('resize', scheduleScoreCursorFollow);
 function suspendScoreCursorFollow() { clearTimeout(scoreCursorResumeTimer); scoreCursorResumeTimer = null; scoreCursorTouching = true; scoreCursorTracking = false; }
 function resumeScoreCursorFollowLater() { clearTimeout(scoreCursorResumeTimer); scoreCursorResumeTimer = setTimeout(() => { scoreCursorResumeTimer = null; scoreCursorTouching = false; scheduleScoreCursorFollow(); }, 1500); }
-const scoreTouchSurface = $('#alpha-tab');
+const scoreTouchSurface = $('#score-scroll');
 scoreTouchSurface.addEventListener('touchstart', suspendScoreCursorFollow, { passive: true });
 scoreTouchSurface.addEventListener('touchend', resumeScoreCursorFollowLater, { passive: true });
 scoreTouchSurface.addEventListener('touchcancel', resumeScoreCursorFollowLater, { passive: true });

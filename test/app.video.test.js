@@ -88,7 +88,9 @@ test('乐手曲谱使用外部媒体原生游标且不加载音色', async () =>
   assert.equal(player.enableAnimatedBeatCursor, true);
   assert.equal(player.enableUserInteraction, false);
   assert.equal(player.scrollMode, b.context.alphaTab.ScrollMode.Off);
-  assert.equal(player.scrollElement, b.get('#alpha-tab'));
+  assert.equal(player.scrollElement, b.get('#score-scroll'));
+  assert.equal(api.scoreElement, b.get('#alpha-tab'));
+  assert.equal(api.scoreElement.style.width, '720px');
   assert.equal(api.customScrollHandler, undefined);
   api.renderStarted.emit(); api.renderFinished.emit();
   assert.equal(b.createdElements.some((node) => node.id === 'sync-cursor'), false);
@@ -97,9 +99,9 @@ test('乐手曲谱使用外部媒体原生游标且不加载音色', async () =>
 test('主机和乐手统一在游标接近边缘后跟随滚动', () => {
   for (const role of ['host', 'member']) {
     const b = browser(role);
-    const score = b.get('#alpha-tab'); let cursorContentX = 180;
+    const score = b.get('#score-scroll'); const renderRoot = b.get('#alpha-tab'); let cursorContentX = 180;
     const cursor = { getBoundingClientRect: () => ({ left: cursorContentX - score.scrollLeft, right: cursorContentX - score.scrollLeft + 3, width: 3 }) };
-    score.querySelector = (selector) => selector === '.at-cursor-beat' ? cursor : null;
+    renderRoot.querySelector = (selector) => selector === '.at-cursor-beat' ? cursor : null;
     b.run(`renderSource(${scoreSource}); renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 });`);
     const api = b.alphaTabApis.at(-1);
     assert.equal(api.settings.player.scrollMode, b.context.alphaTab.ScrollMode.Off);
@@ -121,8 +123,8 @@ test('主机和乐手统一在游标接近边缘后跟随滚动', () => {
 });
 
 test('手机触摸横向滑动时暂停自动跟随', async () => {
-  const b = browser('member'); const score = b.get('#alpha-tab'); let cursorContentX = 500;
-  score.querySelector = (selector) => selector === '.at-cursor-beat' ? { getBoundingClientRect: () => ({ left: cursorContentX - score.scrollLeft, right: cursorContentX - score.scrollLeft + 3, width: 3 }) } : null;
+  const b = browser('member'); const score = b.get('#score-scroll'); let cursorContentX = 500;
+  b.get('#alpha-tab').querySelector = (selector) => selector === '.at-cursor-beat' ? { getBoundingClientRect: () => ({ left: cursorContentX - score.scrollLeft, right: cursorContentX - score.scrollLeft + 3, width: 3 }) } : null;
   b.run(`renderSource(${scoreSource}); renderPlayback({ positionMs: 4200, isPlaying: true, revision: 2 });`);
   b.flushAnimationFrame();
   assert.equal(score.scrollLeft, 415);
@@ -134,8 +136,8 @@ test('手机触摸横向滑动时暂停自动跟随', async () => {
 
 test('主机暂停后重播立即恢复谱面跟随', async () => {
   const b = browser('host', undefined, { playerReadyOnConstruct: true });
-  const score = b.get('#alpha-tab'); let cursorContentX = 500;
-  score.querySelector = (selector) => selector === '.at-cursor-beat' ? { getBoundingClientRect: () => ({ left: cursorContentX - score.scrollLeft, right: cursorContentX - score.scrollLeft + 3, width: 3 }) } : null;
+  const score = b.get('#score-scroll'); let cursorContentX = 500;
+  b.get('#alpha-tab').querySelector = (selector) => selector === '.at-cursor-beat' ? { getBoundingClientRect: () => ({ left: cursorContentX - score.scrollLeft, right: cursorContentX - score.scrollLeft + 3, width: 3 }) } : null;
   b.run(`renderSource(${scoreSource});`);
   await new Promise((resolve) => setImmediate(resolve));
   const api = b.alphaTabApis.at(-1); api.renderFinished.emit(); api.soundFontLoaded.emit();
@@ -150,8 +152,8 @@ test('主机暂停后重播立即恢复谱面跟随', async () => {
 test('成员原生全屏和旋转只重新定位游标而不重排谱面', async () => {
   const b = browser('member');
   b.run(`renderSource(${scoreSource});`);
-  const api = b.alphaTabApis.at(-1); const scoreElement = b.get('#alpha-tab'); let cursorContentX = 700;
-  scoreElement.querySelector = (selector) => selector === '.at-cursor-beat' ? { getBoundingClientRect: () => ({ left: cursorContentX - scoreElement.scrollLeft, right: cursorContentX - scoreElement.scrollLeft + 3, width: 3 }) } : null;
+  const api = b.alphaTabApis.at(-1); const scoreElement = b.get('#score-scroll'); let cursorContentX = 700;
+  b.get('#alpha-tab').querySelector = (selector) => selector === '.at-cursor-beat' ? { getBoundingClientRect: () => ({ left: cursorContentX - scoreElement.scrollLeft, right: cursorContentX - scoreElement.scrollLeft + 3, width: 3 }) } : null;
   api.renderFinished.emit();
   b.flushAnimationFrame();
   scoreElement.scrollLeft = 0;
@@ -470,13 +472,13 @@ test('视频切回曲谱后重新加载 AlphaTab、保留主机伴奏和谱面�
   assert.equal(api.settings.player.enablePlayer, true);
   assert.equal(api.settings.player.playerMode, b.context.alphaTab.PlayerMode.EnabledSynthesizer);
   assert.equal(api.settings.player.scrollMode, b.context.alphaTab.ScrollMode.Off);
-  assert.equal(api.settings.player.scrollElement, b.get('#alpha-tab'));
+  assert.equal(api.settings.player.scrollElement, b.get('#score-scroll'));
   assert.equal(api.loaded.bytes.byteLength, 8);
   assert.equal(b.get('#video-player').classList.contains('hidden'), true);
   assert.equal(b.get('#prepare-audio').classList.contains('hidden'), false);
   b.run(`renderPlayback(${paused});`); api.soundFontLoaded.emit();
   await b.get('#toggle-play').emit('click'); assert.equal(b.sent.at(-1).isPlaying, true);
-  let fullscreen = false; b.get('#alpha-tab').requestFullscreen = async () => { fullscreen = true; };
+  let fullscreen = false; b.get('#score-scroll').requestFullscreen = async () => { fullscreen = true; };
   await b.get('#fullscreen-score').emit('click'); assert.equal(fullscreen, true);
 });
 
