@@ -1,5 +1,36 @@
 # 更新记录
 
+## 1.0.5 - 2026-11-03
+
+### 共同功能
+
+- 新增本地视频上传与同步播放，主机控制播放、暂停和跳转，成员端静音跟随。
+- 曲谱使用原生游标并改进各设备播放时的谱面跟随与移动端横屏滚动。
+
+### Android 主机端
+
+- 修复文件选择器把扩展名作为 MIME 类型过滤，导致 `.gp5` 等曲谱置灰无法选择；选择后仍由服务端校验文件格式与内容。
+
+### 1.0.4 以来的其他变更
+
+- 新增可侧载的 Android 主机 APK：手机本机运行完整 Band Room 服务端，其他设备照旧用浏览器扫码加入。
+- 采用原生 Java 外壳 + Node.js Mobile 18.20.4，而非重写服务端：沿用同一份服务端代码，
+  Express 5 路由、WebSocket 房间状态、AlphaTab 曲谱解析、上传冲突控制与 Range 视频流全部原样复用。
+  1.0.4 曾以 React Native 方案实现又移除，这次换成不引入 JavaScript 桥的轻量实现。
+- 前台服务跑在独立的 host 子进程，specialUse 类型、subtype 为 local_network_rehearsal_host；
+  通知先于资产解包显示，满足 Android 8 的 startForeground 时限。切后台与锁屏后房间继续运行。
+- WebView 只加载本机 127.0.0.1:4173，禁用 file 与 content 协议，任意外部导航交给系统浏览器。
+- 运行目录按「版本号-versionCode」分版本，并用 APK 的 lastUpdateTime 作为资源指纹，
+  避免同一版本重新打包后复用过期资源；用户媒体放在独立目录，升级不触碰。
+- 通知「停止主机」打内部令牌端点优雅关服，令牌随机且只接受回环地址；服务 exported=false，外部无法直接调起。
+- 构建链：pnpm run dist:android 依次准备 Node 资源、校验并下载 Node.js Mobile（固定 SHA-256）、
+  Gradle 打包、APK 结构校验。首版最低 Android 8.0（API 26），同时打入 arm64-v8a 与 x86_64。
+- 兼容性修复：Node.js Mobile 的 V8 未启用 Unicode 属性转义，Express 5 依赖的 path-to-regexp 第八版
+  用 Unicode 属性校验参数名会抛 SyntaxError。打包脚本按需把这三条正则替换为等价的常用 Unicode 区段版本，
+  仅作用于 Android 资源副本，桌面端源码不变。
+- 调试期修复：Application.onCreate 在主机子进程里也会执行，触碰 WebView 会触发数据目录锁冲突并让服务崩溃，
+  现按进程名跳过；Activity 健康检查改到后台线程，避免 NetworkOnMainThreadException 导致永远停在「启动中」。
+
 ## 1.0.4 - 2026-10-07
 
 ### 范围收敛：只做桌面端

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Band Room</string>
+    <string name="host_channel_name">Band Room 主机</string>
+    <string name="host_channel_description">局域网排练主机运行状态</string>
+</resources>

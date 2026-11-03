@@ -229,14 +229,29 @@ app.post('/api/rooms/:roomId/video', (request, response) => {
 app.use(express.json({ limit: '22mb' }));
 // 将 AlphaTab 的 ESM、字体和 worker 作为本地静态资源提供，局域网客户端无需联网。
 app.use('/alphatab', express.static(alphaTabDistDir, { cacheControl: true, maxAge: '1d' }));
-app.get('/legal-files/Band-Room-AGPL-3.0.txt', (_request, response) => response.sendFile(join(rootDir, 'LICENSE')));
-app.get('/legal-files/THIRD_PARTY_NOTICES.md', (_request, response) => response.sendFile(join(rootDir, 'THIRD_PARTY_NOTICES.md')));
+app.get('/legal-files/Band-Room-AGPL-3.0.txt', (_request, response) => response.sendFile(join(rootDir, 'LICENSE'), { dotfiles: 'allow' }));
+app.get('/legal-files/THIRD_PARTY_NOTICES.md', (_request, response) => response.sendFile(join(rootDir, 'THIRD_PARTY_NOTICES.md'), { dotfiles: 'allow' }));
 app.use('/legal-files', express.static(join(rootDir, 'legal'), { cacheControl: true, maxAge: '1d' }));
 app.get('/', (_request, response) => response.redirect('/host'));
+app.get(['/host', '/join'], (_request, response) => response.sendFile(join(rootDir, 'public', 'index.html'), { dotfiles: 'allow' }));
 app.use(express.static(`${rootDir}/public`, { cacheControl: false }));
-app.get(['/host', '/join'], (_request, response) => response.sendFile(join(rootDir, 'public', 'index.html')));
 function listeningPort() { const address = server.address(); return typeof address === 'object' && address ? address.port : port; }
 app.get('/api/health', (_request, response) => response.json({ ok: true, service: 'Band Room', version: packageMetadata.version, rooms: rooms.size, timestamp: Date.now() }));
+app.post('/api/internal/shutdown', (request, response) => {
+  const shutdownToken = process.env.BAND_ROOM_SHUTDOWN_TOKEN;
+  if (process.env.BAND_ROOM_ANDROID !== '1' || !shutdownToken) return response.sendStatus(404);
+  const bearer = /^Bearer (\S+)$/.exec(request.get('authorization') ?? '');
+  if (!bearer) return response.sendStatus(401);
+  const address = request.socket.remoteAddress;
+  if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address) || bearer[1] !== shutdownToken) return response.sendStatus(403);
+  response.once('finish', () => setImmediate(() => {
+    stopBandRoomServer().catch((error) => {
+      console.error('Android 主机停止失败：', error);
+      process.exitCode = 1;
+    });
+  }));
+  response.status(202).json({ stopping: true });
+});
 app.get('/api/network', (_request, response) => { const activePort = listeningPort(); response.json({ port: activePort, origins: lanAddresses().map((ip) => `http://${ip}:${activePort}`) }); });
 app.get('/api/qrcode', async (request, response) => {
   const value = String(request.query.url ?? '');

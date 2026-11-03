@@ -69,6 +69,7 @@ Band Room 让主机独占播放/暂停/跳转，所有乐手设备的谱面游�
 pnpm install --frozen-lockfile
 pnpm dist:mac          # 一份 DMG，同时包含 arm64 与 x64
 pnpm dist:win          # Windows x64 NSIS 安装器
+pnpm dist:android      # 可侧载的 Android 主机 APK（arm64-v8a + x86_64）
 pnpm dist:checksums    # 为 release/ 顶层的交付产物生成 SHA256SUMS.txt 与发布清单
 ```
 
@@ -78,6 +79,27 @@ pnpm dist:checksums    # 为 release/ 顶层的交付产物生成 SHA256SUMS.txt
 `dist:win` 需要在 Windows 上构建（或自行配置 wine）；仓库的 CI 只跑语法检查与集成测试，不产出安装包。
 
 桌面壳使用 Electron 启动同一套 Express/WebSocket 服务，自动选择可用端口并打开 `/host`。
+
+### Android 主机端
+
+`pnpm dist:android` 产出 `android/app/build/outputs/apk/release/app-release.apk`，用 Android 调试证书签名，可直接侧载。
+它依次执行：
+
+1. `prepare-android-node`：把服务端、网页、法律文件与物化后的生产依赖复制到 `assets/nodejs-project/`，
+   并按需给 Node.js Mobile 打 Unicode 正则兼容补丁。
+2. `fetch:nodejs-mobile`：下载固定版本的 Node.js Mobile 18.20.4 并校验 SHA-256，
+   解出 `libnode.so`（arm64-v8a / x86_64）与头文件。
+3. `build-android`：调用 Gradle wrapper 打包，并运行 APK 结构校验。
+
+需要 JDK 17–21、Android SDK（platform 35、build-tools 35.0.0、NDK 27.0.12077973、CMake 3.22.1）。
+SDK 路径通过 `ANDROID_SDK_ROOT` 或 `android/local.properties` 指定。
+
+**安装与首次启动**：APK 未做 Play 商店签名，安装时需允许「安装未知来源应用」。
+最低 Android 8.0（API 26）。打开后应用会启动前台服务并在通知栏常驻，
+WebView 只加载本机 `http://127.0.0.1:4173/host`，其余设备用页面上的二维码或局域网地址加入。
+
+**主机端与乐手端的区别**：Android 手机上运行的是完整主机（可创建房间、上传曲谱与视频、控制播放）。
+其他乐手设备仍然只需要浏览器，不需要安装 APK。
 上传的临时曲谱与视频写入系统用户数据目录，不会尝试修改只读的应用安装目录。
 
 ## 目录结构

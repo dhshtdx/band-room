@@ -6,10 +6,11 @@ worktrees/
 .agent-continuity/
 
 # Dependencies and caches
-node_modules/
+node_modules
 
 # Generated releases
 release/
+release-win/
 dist/
 *.dmg
 *.exe
@@ -34,3 +35,24 @@ work/
 # Logs and test output
 *.log
 coverage/
+
+# Generated Android Node assets
+android/app/src/main/assets/nodejs-project/
+
+# Downloaded Node.js Mobile runtime (fetch-nodejs-mobile.mjs)
+android/nodejs-mobile/
+android/app/src/main/jniLibs/
+android/app/src/main/cpp/include/
+
+# Android build output and local SDK config
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.cxx/
+android/app/.cxx/
+*.apk
+*.aab
+
+# Node.js Mobile download cache
+.cache/
