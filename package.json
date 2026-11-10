@@ -22,10 +22,10 @@
     "dist:android": "node scripts/prepare-android-node.mjs && node scripts/fetch-nodejs-mobile.mjs && node scripts/build-android.mjs"
   },
   "dependencies": {
-    "@coderline/alphatab": "^1.8.4",
-    "express": "^5.2.1",
+    "@coderline/alphatab": "^1.9.0",
+    "express": "^5.3.0",
     "qrcode": "^1.5.4",
-    "ws": "^8.21.3"
+    "ws": "^8.22.1"
   },
   "engines": {
     "node": ">=20"
